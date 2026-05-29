@@ -1,8 +1,8 @@
 # Job Hunter Agent — Nabeel Keblawi
 
-Scans your favorite employer career pages on command, scores every listing against your profile
-using Claude, and emails you the top N results with fit score, rationale, and a
-concrete skills gap for each role.
+An agentic job search tool powered by Claude. The agent autonomously decides which employers
+to check, in what order, and stops the moment it finds your target number of HIGH-priority
+listings — then emails you the results.
 
 ![Sample Email Result](images/email_example.jpg)
 
@@ -11,94 +11,93 @@ concrete skills gap for each role.
 ## Quick Start
 
 ```bash
-# 1. Activate the virtual environment (contains all required dependencies)
+# 1. Activate the virtual environment
 source jh/bin/activate
 
-# 2. Fill in config.yaml (see Configuration below)
+# 2. Copy keys.yaml.example → keys.yaml and fill in your credentials
+cp keys.yaml.example keys.yaml
 
 # 3. Run
-python job_hunter.py             # Top 5 results (default)
-python job_hunter.py -n 5        # Top 10
-python job_hunter.py -n 20       # Top 20 (may cost more against your usage)
-python job_hunter.py --help      # Get help on using the job hunter agent
+python job_hunter.py             # find top 5 HIGH-priority results (default)
+python job_hunter.py -n 10       # find top 10 before stopping
+python job_hunter.py --dry-run   # search and score without sending email
+python job_hunter.py --reset     # clear seen log, re-surface old listings
+python job_hunter.py --help      # all options
 ```
 
 ---
 
-## Configuration (config.yaml)
+## Configuration
 
-Four things to fill in before first run:
+Credentials live in **`keys.yaml`** (gitignored — never committed). Copy the example to get started:
+
+```bash
+cp keys.yaml.example keys.yaml
+```
+
+Four values to fill in:
 
 ```yaml
 email:
-  from:     "your.gmail@gmail.com"       # Gmail you're sending FROM
-  username: "your.gmail@gmail.com"       # same address
-  password: "xxxx xxxx xxxx xxxx"        # 16-char Gmail App Password (NOT your real password)
-                                         # Get it: https://myaccount.google.com/apppasswords
+  from:     "your.gmail@gmail.com"
+  username: "your.gmail@gmail.com"
+  password: "xxxx xxxx xxxx xxxx"   # 16-char Gmail App Password
+                                     # Get it: https://myaccount.google.com/apppasswords
 
-anthropic_api_key: "sk-ant-..."          # console.anthropic.com → API Keys
-                                         # Set to "ENV" to use ANTHROPIC_API_KEY env var instead
+anthropic_api_key: "sk-ant-..."     # console.anthropic.com → API Keys
+                                     # Set to "ENV" to use ANTHROPIC_API_KEY env var instead
 
-usajobs_api_key: "YOUR_USAJOBS_API_KEY"  # ← paste your USAJobs key here
-usajobs_email:   "your.gmail@gmail.com"  # must match the email you used to request the key
+usajobs_api_key: "YOUR_KEY"         # optional — email access@usajobs.gov for a free key
+usajobs_email:   "your@email.com"
 ```
 
-Everything else (prompts, org lists) is tunable but works out of the box.
+Everything else (org lists, scoring prompts, candidate profile) lives in **`config.yaml`**.
+
+---
+
+## How It Works
+
+The agent uses Claude's tool use API in an autonomous loop:
+
+1. **Plans** — calls `list_orgs` to see all configured sources
+2. **Fetches** — checks Greenhouse boards (structured API), HTML careers pages, and USAJobs
+3. **Scores** — evaluates each listing against the candidate profile in real time
+4. **Stops** — the moment it accumulates the target number of HIGH-priority fresh results
+5. **Reports** — builds an HTML email and sends it
+
+Unlike a scripted pipeline, the agent decides which orgs to prioritize, skips sources that look
+unproductive, and adapts based on what it finds. It never asks for confirmation — just searches,
+scores, and reports.
 
 ---
 
 ## Sources
 
-| Source | Count | Method | Notes |
-|---|---|---|---|
-| 🌿 Greenhouse API | 14 orgs | Free public GET API | Most reliable; no scraping |
-| 🌐 HTML scraping | 48 orgs | Polite scraping (1 req/day) | Static pages work well; Workday/iCIMS may be JS-rendered |
-| 🏛️ USAJobs API | Federal listings | Official REST API | Requires free API key |
+| Source | Method | Notes |
+|---|---|---|
+| 🌿 Greenhouse API | Free public GET API | Most reliable; structured data |
+| 🌐 HTML scraping | Polite scraping (1 req/day) | Static pages work well; JS-rendered pages flagged |
+| 🏛️ USAJobs API | Official REST API | Requires free API key |
 
-JS-rendered pages (Workday, iCIMS, Taleo) return empty — the email warnings
-section flags these so you can check them manually.
+JS-rendered pages (Workday, iCIMS, Taleo) return little text — the email warnings section
+flags these so you can check them manually.
 
 ---
 
 ## Email Output
 
-Each listing in the email shows:
+Each listing shows:
 - **Fit score** (0–100) and **priority** badge (HIGH / MEDIUM / LOW)
 - **Rationale** — 2-sentence honest assessment specific to that listing
-- **Skills Gap** — amber callout listing only what you're missing for that role
-  (suppressed if gap is "None")
-- **Flags** — any hard disqualifiers (on-call, relocation, salary, etc.)
+- **Skills Gap** — amber callout for what you're missing (suppressed if none)
+- **Flags** — hard disqualifiers (on-call, relocation required, salary, etc.)
 - **Apply link**
 
 ---
 
-## Org Site Types
+## Adding Orgs
 
-**Federal Agencies (use USAJobs API):** - best served by the USAJobs API source; HTML is a fallback
-```yaml
-federal_orgs:
-  - name: "NOAA"
-    agency_code: "CM"
-    keywords: ["physical scientist", "meteorologist"]
-
-  - name: "USGS"
-    agency_code: "GS"
-    keywords: ["operations research analyst", "geologist"]
-
-  - name: "EPA"
-    agency_code: "EP"
-    keywords: ["physical scientist", "environmental scientist"]
-
-  - name: "NASA"
-    agency_code: "NN"
-    keywords: ["program analyst"]
-
-  - name: "DOE"
-    agency_code: "EN"
-    keywords: ["data scientist", "data engineer", "program analyst"]
-```
-
-**Greenhouse**:
+**Greenhouse:**
 ```yaml
 greenhouse_orgs:
   - name: "Company Name"
@@ -112,20 +111,22 @@ html_orgs:
     careers_url: "https://careers.example.com/jobs"
 ```
 
+**USAJobs** is configured via `usajobs_searches` keywords in `config.yaml`.
+
 ---
 
 ## Cost
 
-~$0.10–0.25 per run depending on how many listings are found.
-Uses claude-sonnet-4-20250514, max_tokens 1000 per scoring batch.
+~$0.15–0.40 per run depending on how many orgs are checked and listings scored.
+Uses `claude-sonnet-4-6`. Runs stop early once the HIGH-priority target is hit,
+which limits cost on days with many matching listings.
 
 ---
 
 ## Tuning
 
 All scoring behavior lives in `config.yaml` under `prompts:` — edit freely:
-- `candidate_profile` — your background, hard non-negotiables, preferences
-- `score_system` — scoring rules for Greenhouse + USAJobs listings
-- `html_extract_system` — extraction + scoring rules for HTML pages
+- `candidate_profile` — your background, hard non-negotiables, location rules, preferences
+- `score_system` — scoring rules for Greenhouse and USAJobs listings
 
 No need to touch `job_hunter.py` for routine tuning.
