@@ -17,10 +17,10 @@ source jh/bin/activate
 # 2. Fill in config.yaml (see Configuration below)
 
 # 3. Run
-python job_hunter.py              # top 10 results (default)
-python job_hunter.py -n 5        # top 5
-python job_hunter.py -n 20       # top 20
-python job_hunter.py --help
+python job_hunter.py             # Top 5 results (default)
+python job_hunter.py -n 5        # Top 10
+python job_hunter.py -n 20       # Top 20 (may cost more against your usage)
+python job_hunter.py --help      # Get help on using the job hunter agent
 ```
 
 ---
