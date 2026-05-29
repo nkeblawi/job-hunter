@@ -1,6 +1,6 @@
 # Job Hunter Agent — Nabeel Keblawi
 
-Scans 62 employer career pages daily, scores every listing against your profile
+Scans your favorite employer career pages on command, scores every listing against your profile
 using Claude, and emails you the top N results with fit score, rationale, and a
 concrete skills gap for each role.
 
