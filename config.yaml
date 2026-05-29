@@ -1,0 +1,514 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Job Hunter Agent — Configuration
+# Edit prompts below to tune scoring behavior without touching job_hunter.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+# API keys and email credentials live in keys.yaml (not this file).
+# Copy keys.yaml.example → keys.yaml and fill in your values.
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPTS — Edit freely. These are sent directly to Claude.
+# candidate_profile  →  used by all sources
+# score_system       →  used when scoring pre-fetched listings (Greenhouse, USAJobs)
+# html_extract_system → used for HTML pages (extract + score in one Claude call)
+# ══════════════════════════════════════════════════════════════════════════════
+
+prompts:
+
+  candidate_profile: |
+    NAME: Nabeel Keblawi
+
+    BACKGROUND:
+    - MS Atmospheric & Oceanic Science (University of Maryland)
+    - BS Information Technology (RIT)
+    - 20+ years: data engineering, software dev, ML/AI, wind energy, meteorology
+    - Current: Meteorological Engineer at Commodity Weather Group
+    - Azure AI Engineer Associate & Azure Data Scientist Associate certified (2024-2026)
+    - Schedule A disability hiring eligibility (federal government)
+
+    TARGET ROLES (strong match):
+    Data Engineer, Analytics Engineer, BI Engineer, Data Scientist, ML Engineer,
+    Research Engineer, Senior Data Analyst, Business Intelligence Analyst,
+    Climate/Weather/Environmental data roles.
+
+    HARD NON-NEGOTIABLES (auto-disqualify if violated):
+    - Must be remote OR hybrid within 20 min of Loudoun County VA (Reston OK)
+    - No relocation required
+    - No on-call / no weekends
+    - Salary minimum $120,000/year (unless exceptional govt pension/benefits)
+    - No pure web dev, no sales, no marketing roles
+
+    LOCATION SCORING RULES (critical):
+    - COMMUTABLE (score normally): Remote, Remote/Hybrid, Loudoun County, Reston, Herndon,
+      Chantilly, McLean, Fairfax, Tysons, Arlington, Alexandria, Northern Virginia (NoVA).
+    - DOWNGRADE (cap fit_score at 50): "Washington, DC" or "DC" unless the listing also
+      explicitly names a NoVA office. DC proper is too far to commute from Loudoun County VA.
+    - DISQUALIFY (set fit_score <= 15, priority = LOW, flag as "Requires relocation"):
+      Any city that is NOT remote and NOT in the DC metro area. This includes Atlanta GA,
+      Houston TX, New York NY, Chicago IL, San Francisco CA, and any other city requiring
+      relocation or long-distance travel. The candidate cannot and will not relocate.
+
+    PREFERENCES (boost score):
+    - Climate, weather, energy, environment industries (top priority)
+    - Healthcare or insurance data (acceptable)
+    - Government/state/county (preferred — Schedule A hiring advantage)
+    - Medium/large stable org; avoid recent large-scale layoffs
+    - Senior-level titles preferred (20+ years experience)
+
+    SKILLS: Python, SQL, C#, AWS (EC2/S3/Lambda/SNS), Azure ML, ETL/ELT,
+    dbt, Snowflake, scikit-learn, XGBoost, Random Forest, Power BI,
+    wind energy domain, atmospheric science domain, stakeholder communication
+
+  score_system: |
+    You are a brutally honest job fit analyst. Given a list of job listings in JSON,
+    score each one against the candidate profile.
+
+    Rules:
+    - fit_score 0-100. Be ruthless. 90+ = near-perfect match. 50 = lukewarm. <30 = poor.
+    - If ANY hard non-negotiable is violated, set fit_score <= 15 and priority = LOW.
+    - LOCATION: Three tiers:
+      (1) COMMUTABLE — score normally: Remote, Remote/Hybrid, NoVA (Reston, Herndon,
+          Chantilly, McLean, Fairfax, Tysons, Arlington, Alexandria, Loudoun County).
+      (2) DOWNGRADE — cap fit_score at 50: "Washington, DC" / "DC" with no NoVA office named.
+      (3) DISQUALIFY — set fit_score <= 15, priority = LOW, flag "Requires relocation":
+          Any non-remote city outside the DC metro area (Atlanta GA, Houston TX, New York NY,
+          Chicago IL, San Francisco CA, etc.). Candidate cannot relocate.
+    - priority: HIGH (score >= 70), MEDIUM (40-69), LOW (<40)
+    - rationale: max 2 sentences, specific to this listing
+    - flags: comma-separated disqualifiers, or empty string if none
+    - skills_gap: list the specific skills or knowledge this candidate is missing for THIS
+      role based on the job description. Be concrete (e.g. "DCIM tooling (Nlyte/Sunbird)",
+      "Tableau", "ITIL Foundation cert", "Kubernetes"). If no meaningful gap, write "None".
+      Max 1 sentence or short comma-separated list. Do NOT restate skills the candidate has.
+
+    Return ONLY a valid JSON array — no markdown, no explanation:
+    [
+      {
+        "title": "",
+        "org": "",
+        "location": "",
+        "salary": "",
+        "posted": "",
+        "url": "",
+        "fit_score": 0,
+        "priority": "HIGH|MEDIUM|LOW",
+        "rationale": "",
+        "skills_gap": "",
+        "flags": ""
+      }
+    ]
+
+  html_extract_system: |
+    You are a brutally honest job fit analyst. You will receive raw text scraped
+    from a company's careers page. Your tasks:
+
+    1. Extract all visible job listings from the text.
+    2. For each listing identify: title, location, salary (if shown), posting date
+       (if shown — use "unknown" if not), and apply URL (if visible).
+    3. Only include listings posted within the last 3 days if dates are detectable.
+       If no dates are visible, include all listings but mark posted as "unknown".
+    4. Score each listing against the candidate profile.
+
+    Rules:
+    - fit_score 0-100. Be ruthless.
+    - If ANY hard non-negotiable is violated, set fit_score <= 15 and priority = LOW.
+    - LOCATION: Three tiers:
+      (1) COMMUTABLE — score normally: Remote, Remote/Hybrid, NoVA (Reston, Herndon,
+          Chantilly, McLean, Fairfax, Tysons, Arlington, Alexandria, Loudoun County).
+      (2) DOWNGRADE — cap fit_score at 50: "Washington, DC" / "DC" with no NoVA office named.
+      (3) DISQUALIFY — set fit_score <= 15, priority = LOW, flag "Requires relocation":
+          Any non-remote city outside the DC metro area (Atlanta GA, Houston TX, New York NY,
+          Chicago IL, San Francisco CA, etc.). Candidate cannot relocate.
+    - priority: HIGH (>=70), MEDIUM (40-69), LOW (<40)
+    - rationale: max 2 sentences
+    - skills_gap: list the specific skills or knowledge this candidate is missing for THIS
+      role based on the job description. Be concrete (e.g. "DCIM tooling (Nlyte/Sunbird)",
+      "Tableau", "ITIL Foundation cert", "Kubernetes"). If no meaningful gap, write "None".
+      Max 1 sentence or short comma-separated list. Do NOT restate skills the candidate has.
+    - flags: comma-separated disqualifiers, or empty string
+
+    Return ONLY a valid JSON array — no markdown, no preamble.
+    Return [] if the page appears empty or JS-rendered with no job listings.
+
+    [
+      {
+        "title": "",
+        "org": "",
+        "location": "",
+        "salary": "",
+        "posted": "",
+        "url": "",
+        "fit_score": 0,
+        "priority": "HIGH|MEDIUM|LOW",
+        "rationale": "",
+        "skills_gap": "",
+        "flags": ""
+      }
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORGANIZATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Greenhouse API orgs ────────────────────────────────────────────────────────
+# Free public API — no auth needed.
+# Verify a token: https://boards.greenhouse.io/TOKEN  (200 OK = valid)
+# NOTE: Accenture Federal Services and Excella confirmed on Greenhouse.
+# All other previous orgs were migrated to html_orgs with correct ATS URLs.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETTINGS
+# ══════════════════════════════════════════════════════════════════════════════
+settings:
+  max_results_per_org: 3    # Max listings from any single org in the email
+
+greenhouse_orgs:
+
+  - name: "Accenture Federal Services"
+    board_token: "accenturefederalservices"
+    # Arlington VA based; many roles are hybrid/remote eligible; Schedule A friendly
+
+  - name: "Excella"
+    board_token: "excella"
+    # Arlington VA; data/analytics consulting; govt + commercial clients
+
+  # Add more confirmed Greenhouse orgs:
+  # - name: "Company Name"
+  #   board_token: "slug"
+
+
+# ── HTML orgs (web scraping fallback) ─────────────────────────────────────────
+# Works well: static government pages, custom career portals
+# Works poorly: Workday/iCIMS/Taleo (JS-rendered) — flagged in email, low ban risk
+
+html_orgs:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # FORMER GREENHOUSE ORGS — corrected ATS URLs (researched March 2026)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - name: "MITRE"
+    careers_url: "https://mitre.wd5.myworkdayjobs.com/MITRE"
+    skip: true  # JS-rendered — skipped to save cost
+    # Workday ATS; McLean VA HQ; FFRDC; data/AI roles; govt mission; very stable
+
+  - name: "Noblis"
+    careers_url: "https://careers.noblis.org/jobs"
+    # Own career portal; Reston VA; nonprofit FFRDC; data engineering + analytics roles
+
+  - name: "ICF International"
+    careers_url: "https://careers.icf.com/us/en/search-results?ak=rl8drj1oygdi"
+    skip: true  # JS-rendered — skipped to save cost
+    # Own Workday portal; Reston VA HQ; energy/environment/climate consulting; strong domain match
+
+  - name: "Guidehouse"
+    careers_urls:
+      - "https://careers.guidehouse.com/jobs?keyword=data+engineer&category=Technology"
+      - "https://careers.guidehouse.com/jobs?keyword=data+scientist&category=Technology"
+      - "https://careers.guidehouse.com/jobs?keyword=analytics+engineer&category=Technology"
+    # Workday portal; Arlington VA; energy + govt + health consulting; strong domain match
+
+  - name: "Peraton"
+    careers_urls:
+      - "https://careers-peraton.icims.com/jobs/search?ss=1&searchKeyword=data+engineer&searchRelation=keyword_all"
+      - "https://careers-peraton.icims.com/jobs/search?ss=1&searchKeyword=data+scientist&searchRelation=keyword_all"
+      - "https://careers-peraton.icims.com/jobs/search?ss=1&searchKeyword=machine+learning+engineer&searchRelation=keyword_all"
+    # iCIMS ATS; Herndon VA HQ; defense IT/data roles; very large and stable
+
+  - name: "Invenergy"
+    careers_url: "https://invenergyllc.wd1.myworkdayjobs.com/invenergycareers"
+    skip: true  # JS-rendered — skipped to save cost
+    # Workday ATS; Chicago HQ, remote data roles; large renewable energy developer
+
+  - name: "Jupiter Intelligence (climate risk analytics)"
+    careers_url: "https://jobs.lever.co/jupiterintel"
+    # Lever ATS; climate risk data; San Mateo CA / remote; STRONG domain match for Nabeel
+
+  - name: "Verisk"
+    careers_url: "https://fa-ewmy-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/requisitions?keyword=data+scientist"
+    skip: true  # JS-rendered — skipped to save cost
+    # Verisk uses Oracle HCM (not Workday) — jobs.verisk.com DNS fails
+
+  # ── Loudoun County Data Center Operators (HTML — data/analytics roles) ──────
+  # NOTE: Most DC operator roles in Loudoun are facilities/ops. These companies
+  # also hire data engineers, analysts, and BI roles to support their OWN operations.
+
+  - name: "Equinix (Ashburn campus HQ)"
+    careers_url: "https://equinix.wd1.myworkdayjobs.com/External?q=data&locations=9bcab45aa6f5015b8c01a79f61010000"
+    skip: true  # JS-rendered — skipped to save cost
+    # Workday ATS; world's largest colo; Ashburn HQ; data/BI/analytics roles; stable REIT
+
+  - name: "Digital Realty (Ashburn/Sterling)"
+    careers_url: "https://careers.digitalrealty.com/search/cfm6/ashburn/jobs"
+    skip: true  # JS-rendered — skipped to save cost
+    # Own Oracle/Taleo portal; 30+ Loudoun facilities; data + BI roles; very stable REIT
+
+  - name: "Vantage Data Centers (Ashburn)"
+    careers_url: "https://vantage-dc.com/company/careers/open-positions/"
+    skip: true  # Workday — JS-rendered
+    # Own portal (links to Workday); Ashburn HQ campus; data analyst/program analyst roles; PE-backed
+
+  - name: "Iron Mountain (Ashburn)"
+    careers_url: "https://ironmountain.wd5.myworkdayjobs.com/iron-mountain-jobs?q=data"
+    skip: true  # JS-rendered — skipped to save cost
+    # Correct Workday slug is wd5/iron-mountain-jobs (wd1/External was returning 500)
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EXISTING HTML ORGS — URLs verified/corrected March 2026
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── Virginia State Government ─────────────────────────────────────────────
+  # Government titles differ from private sector — "Data Engineer" barely exists.
+  # Real VA state title conventions: IT Specialist, Operations Research Analyst,
+  # Physical Scientist, Environmental Scientist, GIS Analyst, Program Analyst.
+  # careers_urls (list) runs all searches and deduplicates before scoring.
+
+  - name: "Virginia State Jobs"
+    skip: true  # JS-rendered filter UI — no raw listings returned
+    skip_ssl_verify: true
+    careers_urls:
+      - "https://www.jobs.virginia.gov/jobs/search?keyword=information+technology+specialist"
+      - "https://www.jobs.virginia.gov/jobs/search?keyword=operations+research+analyst"
+      - "https://www.jobs.virginia.gov/jobs/search?keyword=environmental+scientist"
+      - "https://www.jobs.virginia.gov/jobs/search?keyword=GIS+analyst"
+      - "https://www.jobs.virginia.gov/jobs/search?keyword=program+analyst"
+      - "https://www.jobs.virginia.gov/jobs/search?keyword=business+intelligence"
+    # Covers all VA agencies: DEQ, VDOT, VDEM, SCC, DMV, VRS, and more
+
+  - name: "VITA - Virginia IT Agency"
+    careers_url: "https://www.vita.virginia.gov/careers/open-positions/"
+    # VITA HQ is Richmond but some remote/hybrid roles exist; data/cloud/infra focus
+
+  # ── County Government ─────────────────────────────────────────────────────
+  - name: "Loudoun County Government"
+    careers_url: "https://www.loudoun.gov/jobs"
+    skip: true  # JS-rendered — skipped to save cost
+
+  - name: "Fairfax County Government"
+    careers_urls:
+      - "https://www.governmentjobs.com/careers/fairfaxcounty?keyword=data+analyst"
+      - "https://www.governmentjobs.com/careers/fairfaxcounty?keyword=data+engineer"
+      - "https://www.governmentjobs.com/careers/fairfaxcounty?keyword=GIS"
+    # NEOGOV/GovernmentJobs — Fairfax County's correct employer slug is fairfaxcounty (not fairfax)
+    # GovernmentJobs.com (NeoGov) — Fairfax County's ATS; static-friendly
+
+  # ── Federal Agencies (NOAA / USGS via USAJobs) ────────────────────────────
+  # OPM series: 1301=Physical Scientist, 1340=Meteorologist, 2210=IT Specialist
+  # 1515=Operations Research Analyst, 0343=Program/Management Analyst
+
+  - name: "NOAA Careers"
+    skip: true  # Covered by USAJobs API source
+    careers_urls:
+      - "https://www.usajobs.gov/Search/Results?d=CM&l=&p=1&k=physical+scientist"
+      - "https://www.usajobs.gov/Search/Results?d=CM&l=&p=1&k=meteorologist"
+      - "https://www.usajobs.gov/Search/Results?d=CM&l=&p=1&k=information+technology+specialist"
+      - "https://www.usajobs.gov/Search/Results?d=CM&l=&p=1&k=operations+research+analyst"
+    # Schedule A eligible; remote roles common in data/science series
+
+  - name: "USGS Careers"
+    skip: true  # Covered by USAJobs API source
+    careers_urls:
+      - "https://www.usajobs.gov/Search/Results?d=GS&l=&p=1&k=physical+scientist"
+      - "https://www.usajobs.gov/Search/Results?d=GS&l=&p=1&k=information+technology+specialist"
+      - "https://www.usajobs.gov/Search/Results?d=GS&l=&p=1&k=operations+research+analyst"
+    # USGS 1301 series; water/climate/earth science data roles"
+
+  # ── Weather / Climate / Energy ────────────────────────────────────────────
+  - name: "Lynker Technologies (Leesburg VA)"
+    careers_url: "https://careers-lynker.icims.com/jobs/search?hashed=-625884911&mobile=false&width=1200&height=500&bga=true&needsRedirect=false&jan1offset=-300&jun1offset=-240"
+    # iCIMS — may be JS-rendered; check manually if flagged
+
+  - name: "Science and Technology Corporation (STC)"
+    careers_url: "https://www.stcnet.com/jobs/"
+    # NOAA/NASA contractor; Hampton VA HQ but many remote roles
+
+  - name: "The Weather Company"
+    careers_url: "https://www.weathercompany.com/careers/"
+    # User-confirmed correct URL (weathercompany.com, not theweathercompany.com)
+
+  - name: "DTN (weather/energy/ag data)"
+    careers_url: "https://www.dtn.com/careers/"
+    # Corrected from broken URL; Burnsville MN HQ; weather/energy/commodity data; strong domain match
+
+  - name: "Wood Mackenzie"
+    careers_url: "https://jobs.smartrecruiters.com/Verisk?search=data"
+    skip: true  # SmartRecruiters JS-rendered
+    # Wood Mackenzie jobs hosted on SmartRecruiters under parent company Verisk
+    # Corrected from broken URL; Edinburgh/global; energy research & analytics; remote data roles
+
+  - name: "RE Tech Advisors (McLean/Fairfax VA)"
+    careers_url: "https://www.retechadvisors.com/careers"
+    # ESG/climate data firm; Fairfax VA office; remote-friendly
+
+  - name: "Aon (climate risk / analytics roles)"
+    careers_urls:
+      - "https://jobs.aon.com/jobs?keywords=data+engineer&location=Virginia"
+      - "https://jobs.aon.com/jobs?keywords=data+scientist&location=Virginia"
+      - "https://jobs.aon.com/jobs?keywords=data+analyst&location=Virginia"
+    # Aon ATS is jobs.aon.com/jobs with keyword+location params
+    # Search Aon careers for climate/data roles specifically
+
+  # ── Defense / Federal Contractors ─────────────────────────────────────────
+  - name: "Leidos"
+    careers_url: "https://leidos.wd5.myworkdayjobs.com/External?q=data+scientist&locations=Virginia"
+    skip: true  # JS-rendered — skipped to save cost
+    # Fixed 403 — switched to Workday direct URL (careers.leidos.com blocks scrapers)
+
+  - name: "Booz Allen Hamilton"
+    careers_url: "https://careers.boozallen.com/jobs?keywords=data+engineer&location=virginia"
+    skip: true  # JS-rendered — skipped to save cost
+        # Workday — likely JS-rendered; flag expected
+
+  - name: "SAIC"
+    careers_url: "https://saic.wd5.myworkdayjobs.com/External?q=data+engineer"
+    skip: true  # JS-rendered — skipped to save cost
+    # jobs.saic.com returns 403 when scraped; Workday direct avoids the block
+
+  - name: "General Dynamics IT (GDIT)"
+    careers_url: "https://gdit.wd5.myworkdayjobs.com/External_Career_Site?q=data+scientist&locations=Virginia"
+    skip: true  # JS-rendered — skipped to save cost
+    # Workday — likely JS-rendered; flag expected
+
+  - name: "Northrop Grumman (Virginia data roles)"
+    careers_url: "https://jobs.northropgrumman.com/careers?query=data+scientist&State=Virginia&domain=ngc.com"
+    skip: true  # JS-rendered — skipped to save cost
+        # Eightfold ATS — JS-rendered likely; flag expected
+
+  - name: "Vantor (formerly Maxar, Herndon/Reston VA)"
+    careers_url: "https://vantor.com/careers/"
+    skip: true  # Uses Workday — JS-rendered; clearance required for most roles
+    # Acquired by NRO; now operating as Vantor; Herndon/Reston VA offices
+
+  - name: "Umbra (Arlington/Reston VA)"
+    careers_url: "https://umbra.space/careers/job-openings/"
+    skip: true  # JS-rendered — skipped to save cost
+    # SAR satellite company; Arlington VA + Reston VA offices
+
+  # ── From 2024 company list — screened and approved for 2026 ──────────────
+
+  - name: "AES Corporation (Arlington VA)"
+    careers_url: "https://aes.wd1.myworkdayjobs.com/AES_US/"
+    skip: true  # JS-rendered — skipped to save cost
+    # Corrected to Workday URL; large utility/clean energy; VA HQ; stable; data/analytics roles
+
+  - name: "ManTech International (Herndon VA)"
+    careers_url: "https://careers.mantech.com/en_US/careers/SearchJobs?1838=%5B169270%5D&1838_format=6020&listFilterMode=1&keyword=data"
+    # careers.mantech.com is correct ATS; www.mantech.com/careers redirects infinitely
+
+  - name: "ESRI (remote data roles)"
+    careers_url: "https://www.esri.com/en-us/about/careers/job-search?q=data&location=remote"
+    skip: true  # JS-rendered — skipped to save cost
+    # GIS/geospatial analytics; Redlands CA HQ; remote data/engineering roles available
+
+  - name: "CleanChoice Energy (Arlington VA)"
+    careers_url: "https://cleanchoiceenergy.com/careers"
+    # CleanChoice has static careers page with actual listings
+    # Local clean energy retailer; Arlington VA; not SV culture
+
+  - name: "CNA Corporation (Arlington VA)"
+    careers_url: "https://www.cna.org/careers/open-positions"
+    # CNA uses their own careers portal at cna.org/careers/positions
+    # CNA (the nonprofit FFRDC) posts directly on cna.org — not on iCIMS
+
+  - name: "CrossCountry Consulting (McLean VA)"
+    careers_url: "https://jobs.lever.co/crosscountry-consulting"
+    # Correct domain is crosscountry-consulting.com (hyphenated); they use Lever ATS
+    # crosscountryconsulting.com (no hyphen) gives SSL handshake failure
+
+  - name: "EDF Renewables North America"
+    careers_url: "https://www.edf-re.com/careers/job-openings/"
+    # EDF Renewables job openings page — static HTML listing
+    # Clean energy; San Diego HQ; remote data roles; strong domain match
+
+  - name: "ERG (Eastern Research Group, Arlington VA)"
+    careers_url: "https://jobs.lever.co/erg"
+    # ERG uses Lever ATS — erg.com/careers just links here; /careers/job-openings/ 404s
+
+  - name: "Exelon (DC-area utility, data roles)"
+    careers_url: "https://jobs.exeloncorp.com/careers-home/jobs"
+    # Corrected to working ATS; large utility (BGE/Pepco parent); DC-area presence; stable
+
+  - name: "MWCOG (Washington DC)"
+    careers_url: "https://www.mwcog.org/about-us/careers/"
+    skip: true  # JS-rendered — skipped to save cost
+    # Former employer; air quality/climate/planning data; DC metro COG; very stable
+
+  - name: "Systems Planning and Analysis / SPA (Alexandria VA)"
+    careers_url: "https://spacareers.com/job-openings/"
+    skip: true  # JS-rendered — skipped to save cost
+    # Defense/energy analyst firm; Alexandria VA; data roles; stable govt contractor
+
+  - name: "CGI Federal (Fairfax VA)"
+    careers_url: "https://cgi.wd3.myworkdayjobs.com/en-US/CGI_External_Careers?q=data+engineer"
+    skip: true  # JS-rendered — skipped to save cost
+    # Added en-US locale prefix — CGI Workday requires it; plain /CGI_External_Careers returns 500
+
+  - name: "Data and Analytic Solutions Inc / DAS (Fairfax VA)"
+    careers_url: "https://dasconsultants.com/careers/"
+    skip: true  # 404 — domain appears dead
+    skip_ssl_verify: true
+    # Removed www. — www.dasolutions.com has SSL hostname mismatch; bare domain may work
+
+  - name: "IntraFi Network (Arlington VA)"
+    careers_url: "https://www.intrafi.com/careers/"
+    # Fintech/banking data; Arlington VA; stable; not SV culture
+
+  - name: "Summit LLC (Fairfax VA)"
+    careers_url: "https://summit-llc.com/careers/"
+    skip: true  # JS-rendered — skipped to save cost
+    # Govt/defense consulting; Fairfax VA; data analytics roles; local
+
+  - name: "RES (Renewable Energy Systems)"
+    careers_url: "https://jobs.jobvite.com/resgroup"
+    # RES uses Jobvite ATS — Workday URL (res.wd3) was returning 500
+
+  # ── Loudoun County Data Center Operators (HTML — smaller/monitoring) ──────
+  - name: "QTS Data Centers (Ashburn/Sterling)"
+    careers_url: "https://careers.qtsdatacenters.com/us/en/search-results"
+    skip: true  # Phenom ATS — JS-rendered
+    # QTS uses Phenom ATS at careers.qtsdatacenters.com
+    # Blackstone-owned; Ashburn VA HQ; data/IT analyst roles alongside ops; stable
+
+  - name: "NTT Global Data Centers (Ashburn)"
+    careers_url: "https://www.nttdata.com/global/en/careers"
+    # careers.ntt.com DNS fails — switched to nttdata.com global careers page
+
+  - name: "CyrusOne (Ashburn/Broadlands)"
+    careers_url: "https://cyrusone.com/company/careers/"
+    skip: true  # Workday — JS-rendered
+    # KKR/GIP-owned; Broadlands Campus (Loudoun) under dev; some analyst roles
+
+  - name: "Oracle Cloud Infrastructure (Ashburn / Reston)"
+    careers_url: "https://careers.oracle.com/jobs/#en/sites/jobsearch/jobs?lastSelectedFacet=LOCATIONS&selectedLocationsFacet=300000000149325"
+    skip: true  # JS-rendered — skipped to save cost
+    # Updated to Ashburn/Reston location filter; data/cloud engineering roles; OCI tooling familiar
+
+  - name: "CoreSite / American Tower (Reston VA)"
+    careers_url: "https://www.coresite.com/about/careers"
+    # CoreSite careers page — may have static listings
+    # Reston VA (Fairfax Co.) — commutable; NYSE-traded parent; capacity/BI analyst roles; stable
+
+  - name: "CloudHQ (Ashburn — largest campus)"
+    careers_url: "https://www.cloudhq.com/careers"
+    skip: true  # Minimal listings; mostly ops/facilities roles
+    # Fixed 404 — cloudhq.net is wrong domain; actual company is cloudhq.com
+
+  - name: "Csquare (formerly Centersquare, Ashburn)"
+    careers_url: "https://centersquaredc.com/careers"
+    # Rebranded to Csquare; careers page has static job listings
+    # 8 Ashburn sites; small team; monitoring for ops analyst / data roles
+
+  - name: "STACK Infrastructure (Ashburn + Leesburg)"
+    careers_url: "https://www.stackinfra.com/company/careers/"
+    # Fixed 404 — path updated to /company/careers/
+
+  - name: "EdgeConneX (Ashburn/Herndon)"
+    careers_url: "https://www.edgeconnex.com/company/careers/"
+    # Corrected URL; Herndon VA + Denver HQ; Top Workplace 2023-2025; monitoring for data/analytics roles
+
+  # Add more:
+  # - name: "Org Name"
+  #   careers_url: "https://..."

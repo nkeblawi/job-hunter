@@ -1,0 +1,25 @@
+# Secrets & credentials
+keys.yaml
+.env
+
+# Runtime state
+seen_jobs.json
+resume_tailor.html
+
+# Logs
+logs/
+
+# Virtual environment
+jh/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# macOS
+.DS_Store
