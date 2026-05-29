@@ -73,6 +73,28 @@ Each listing in the email shows:
 ## Org Site Types
 
 **Federal Agencies (use USAJobs API):** - best served by the USAJobs API source; HTML is a fallback
+```yaml
+federal_orgs:
+  - name: "NOAA"
+    agency_code: "CM"
+    keywords: ["physical scientist", "meteorologist"]
+
+  - name: "USGS"
+    agency_code: "GS"
+    keywords: ["operations research analyst", "geologist"]
+
+  - name: "EPA"
+    agency_code: "EP"
+    keywords: ["physical scientist", "environmental scientist"]
+
+  - name: "NASA"
+    agency_code: "NN"
+    keywords: ["program analyst"]
+
+  - name: "DOE"
+    agency_code: "EN"
+    keywords: ["data scientist", "data engineer", "program analyst"]
+```
 
 **Greenhouse**:
 ```yaml
