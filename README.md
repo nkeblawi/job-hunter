@@ -70,42 +70,11 @@ Each listing in the email shows:
 
 ---
 
-## Org List Summary
+## Org Site Types
 
-**Greenhouse API (14):**
-MITRE, Noblis, ICF, Guidehouse, Peraton, Invenergy, Jupiter Intelligence, Verisk,
-Accenture Federal Services, Excella, Equinix, Digital Realty, Vantage Data Centers,
-Iron Mountain
+**Federal Agencies (use USAJobs API):** - best served by the USAJobs API source; HTML is a fallback
 
-**HTML — Virginia / County Govt:**
-Virginia State Jobs (×2 keyword searches), VITA, Loudoun County, Fairfax County
-
-**HTML — Federal Agencies:**
-NOAA (USAJobs search), USGS (USAJobs search)
-*(best served by the USAJobs API source — HTML is a fallback)*
-
-**HTML — Weather / Climate / Energy:**
-Lynker Technologies, Science & Technology Corp (STC), The Weather Company, DTN,
-Wood Mackenzie, EDP Renewables, RE Tech Advisors, Aon (climate risk),
-EDF Renewables, ERG, RES, AES Corporation, CleanChoice Energy, Exelon
-
-**HTML — Defense / Federal Contractors:**
-Leidos, Booz Allen Hamilton, SAIC, General Dynamics IT, Northrop Grumman,
-Maxar/Vantor, ManTech, CGI Federal, SPA, CNA Corporation, CrossCountry Consulting,
-Data and Analytic Solutions (DAS), Summit LLC
-
-**HTML — Loudoun County Data Centers:**
-QTS, NTT Global, CyrusOne, Oracle Cloud, CoreSite/American Tower,
-CloudHQ, Centersquare, STACK Infrastructure, Corscale, EdgeConneX
-
-**HTML — Other:**
-ESRI, MWCOG, IntraFi Network, Umbra, Compass Datacenters
-
----
-
-## Adding More Orgs
-
-**Greenhouse** (best — free API, no scraping):
+**Greenhouse**:
 ```yaml
 greenhouse_orgs:
   - name: "Company Name"
