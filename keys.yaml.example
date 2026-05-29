@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# keys.yaml — copy this file to keys.yaml and fill in your values
+# keys.yaml is gitignored and never committed
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+email:
+  from: "you@gmail.com"
+  to: "you@gmail.com"
+  username: "you@gmail.com"
+  password: "xxxx xxxx xxxx xxxx"   # Gmail 16-char App Password (not your real password)
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 465
+
+# ── Anthropic API ─────────────────────────────────────────────────────────────
+# https://console.anthropic.com/ → API Keys → Create Key
+# Set to "ENV" to use the ANTHROPIC_API_KEY environment variable instead
+anthropic_api_key: "sk-ant-..."
+
+# ── USAJobs API (optional) ────────────────────────────────────────────────────
+# Email access@usajobs.gov to request a free API key
+usajobs_api_key: "YOUR_USAJOBS_API_KEY"
+usajobs_email: "you@gmail.com"

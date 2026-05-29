@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Job Hunter Agent — Nabeel Keblawi
-Single file. All source logic is in clearly labelled sections.
-Prompts and candidate profile live in config.yaml so you can tweak without touching code.
+Job Hunter Agent — using Claude
+Claude autonomously decides which orgs to check, extracts and scores listings,
+and stops when it finds the target number of HIGH-priority results.
 
 Usage:
-  python job_hunter.py              # returns top 10 (default)
-  python job_hunter.py -n 5        # returns top 5
-  python job_hunter.py -n 20       # returns top 20
+  python job_hunter.py             # find top 5 HIGH-priority results (default)
+  python job_hunter.py -n 10       # find top 10 HIGH-priority results
+  python job_hunter.py --reset     # clear seen log before running
+  python job_hunter.py --dry-run   # search and score but don't send email
 """
 
 import argparse
@@ -15,42 +16,79 @@ import json
 import os
 import re
 import smtplib
+import sys
 import time
-import traceback
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 import anthropic
 import requests
 import yaml
 from bs4 import BeautifulSoup
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIG
+# CONFIG  — points at the existing job-hunter config so orgs stay in one place
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_config(path="config.yaml", keys_path="keys.yaml") -> dict:
-    with open(path) as f:
+_HERE = Path(__file__).parent
+CONFIG_PATH = _HERE / "config.yaml"
+KEYS_PATH = _HERE / "keys.yaml"
+SEEN_LOG = _HERE / "seen_jobs.json"
+MAX_ITERS = 60  # safety cap on agent loop iterations
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
-    # Merge credentials from keys.yaml (values in keys.yaml take precedence)
     try:
-        with open(keys_path) as f:
+        with open(KEYS_PATH) as f:
             keys = yaml.safe_load(f)
         if keys:
             cfg.update(keys)
     except FileNotFoundError:
-        print(f"⚠️  {keys_path} not found — using config.yaml values or ENV vars only.")
+        print(f"⚠️  keys.yaml not found at {KEYS_PATH} — using ENV vars only.")
     return cfg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEEN-JOBS LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def seen_key(job: dict) -> str:
+    return f"{job.get('org','').lower().strip()}|{job.get('title','').lower().strip()}"
+
+
+def load_seen() -> dict:
+    try:
+        with open(SEEN_LOG) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_seen(seen: dict, new_jobs: list[dict], run_date: str):
+    for job in new_jobs:
+        k = seen_key(job)
+        if k not in seen:
+            seen[k] = {
+                "first_seen": run_date,
+                "title": job.get("title", ""),
+                "org": job.get("org", ""),
+            }
+    with open(SEEN_LOG, "w") as f:
+        json.dump(seen, f, indent=2)
+    print(f"  Seen-jobs log updated → {len(seen)} total entries")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def is_recent(date_str: str, days: int = 3) -> bool:
-    """True if date_str is within the last N days. Handles ISO 8601."""
     if not date_str or str(date_str).lower() == "unknown":
         return False
     try:
@@ -60,187 +98,6 @@ def is_recent(date_str: str, days: int = 3) -> bool:
         return False
 
 
-def clean_json(raw: str) -> str:
-    """Extract the first valid JSON array from Claude's response, handling fences and prose."""
-    raw = raw.strip()
-    # Strip markdown fences
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"^```\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-    # Find the first [ and extract exactly to its matching ]
-    start = raw.find("[")
-    if start == -1:
-        return "[]"
-    depth = 0
-    for i, ch in enumerate(raw[start:], start):
-        if ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                return raw[start:i+1]
-    # Unclosed array — return from [ onward and let caller handle it
-    return raw[start:]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLAUDE SCORING  (shared by all sources)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def score_listings(listings: list[dict], prompts: dict) -> list[dict]:
-    """
-    Score a list of pre-fetched listings with Claude.
-    Uses prompts['score_system'] + prompts['candidate_profile'] from config.
-    Processes in batches of 5. Retries up to 3x on overloaded errors.
-    Never raises — returns unscored on failure.
-    """
-    if not listings:
-        return []
-
-    system_prompt = (
-        prompts.get("score_system", "Score these job listings against the candidate profile.")
-        + "\n\nCANDIDATE PROFILE:\n"
-        + prompts.get("candidate_profile", "")
-    )
-
-    sources = [l.get("source", "unknown") for l in listings]
-    clean   = [{k: v for k, v in l.items() if k != "source"} for l in listings]
-    client  = anthropic.Anthropic()
-    scored_all = []
-
-    for i in range(0, len(clean), 5):
-        batch         = clean[i:i + 5]
-        batch_sources = sources[i:i + 5]
-        batch_num     = i // 5 + 1
-        success = False
-        for attempt in range(3):
-            try:
-                response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=3000,
-                    system=system_prompt,
-                    messages=[{
-                        "role": "user",
-                        "content": f"Score these {len(batch)} listings:\n\n{json.dumps(batch, indent=2)}"
-                    }]
-                )
-                scored_batch = json.loads(clean_json(response.content[0].text))
-                for j, item in enumerate(scored_batch):
-                    item["source"] = batch_sources[j] if j < len(batch_sources) else "unknown"
-                scored_all.extend(scored_batch)
-                success = True
-                break
-            except Exception as e:
-                is_overloaded = "529" in str(e) or "overloaded" in str(e).lower()
-                if is_overloaded and attempt < 2:
-                    wait = 15 * (attempt + 1)
-                    print(f"    ⏳ API overloaded (batch {batch_num}), retrying in {wait}s...")
-                    time.sleep(wait)
-                else:
-                    print(f"    ⚠️  Scoring error (batch {batch_num}): {e}")
-                    for j, item in enumerate(batch):
-                        item["source"] = batch_sources[j] if j < len(batch_sources) else "unknown"
-                        item.setdefault("fit_score", 0)
-                        item.setdefault("priority",  "LOW")
-                        item.setdefault("rationale", "Scoring failed — review manually.")
-                        item.setdefault("skills_gap", "—")
-                        item.setdefault("flags",     "scoring error")
-                    scored_all.extend(batch)
-                    break
-
-    return scored_all
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SOURCE: GREENHOUSE API
-# Public GET API — no auth needed.
-# Token check: https://boards.greenhouse.io/TOKEN  (200 = valid, 404 = wrong)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_greenhouse(orgs: list[dict], prompts: dict, days: int = 3) -> tuple[list[dict], list[str]]:
-    BASE = "https://boards-api.greenhouse.io/v1/boards/{token}/jobs"
-    all_listings, warnings = [], []
-
-    for org in orgs:
-        name  = org["name"]
-        token = org["board_token"]
-        print(f"  → {name} (Greenhouse) ...", end="", flush=True)
-        try:
-            resp = requests.get(BASE.format(token=token), params={"content": "true"}, timeout=15)
-            if resp.status_code == 404:
-                raise ValueError(f"Board token '{token}' not found — verify at boards.greenhouse.io/{token}")
-            resp.raise_for_status()
-
-            TITLE_KEYWORDS = [
-                "data", "analyst", "engineer", "scientist", "analytics",
-                "machine learning", "ml", "ai", "intelligence", "python",
-                "cloud", "etl", "pipeline", "meteorolog", "climate",
-                "weather", "atmospheric", "research", "snowflake", "sql",
-            ]
-            OVERFLOW_LIMIT = 50
-
-            all_jobs = resp.json().get("jobs", [])
-
-            # Step 1: Title filter first — cheapest cut
-            title_matched = []
-            for job in all_jobs:
-                title = job.get("title", "").lower()
-                if any(kw in title for kw in TITLE_KEYWORDS):
-                    title_matched.append(job)
-
-            # Step 2: Date filter using created_at (more reliable) with updated_at fallback
-            def job_date(j):
-                return j.get("created_at") or j.get("updated_at") or ""
-
-            date_filtered = [j for j in title_matched if not job_date(j) or is_recent(job_date(j), days)]
-
-            # Step 3: If date filter isn't working (all pass), cap at OVERFLOW_LIMIT most recent
-            careers_url = f"https://boards.greenhouse.io/{token}"
-            if len(date_filtered) > OVERFLOW_LIMIT:
-                # Sort by date descending and take top OVERFLOW_LIMIT
-                date_filtered.sort(key=lambda j: job_date(j), reverse=True)
-                overflow_count = len(date_filtered)
-                date_filtered = date_filtered[:OVERFLOW_LIMIT]
-                print(f" ⚠️  {overflow_count} title-matched listings; capped at {OVERFLOW_LIMIT} most recent")
-                warnings.append(
-                    f"<b>{name}</b>: {overflow_count} relevant listings found but date filter unreliable — "
-                    f"showing {OVERFLOW_LIMIT} most recent. "
-                    f"&nbsp;<a href='{careers_url}' style='color:#1a73e8;font-size:11px'>[browse all jobs manually]</a>"
-                )
-
-            listings = []
-            for job in date_filtered:
-                listings.append({
-                    "source":   "greenhouse_api",
-                    "org":      name,
-                    "title":    job.get("title", ""),
-                    "location": job.get("location", {}).get("name", "Unknown"),
-                    "salary":   "Not listed",
-                    "posted":   job_date(job),
-                    "url":      job.get("absolute_url", ""),
-                })
-
-            skipped_title = len(all_jobs) - len(title_matched)
-            print(f" {len(listings)} relevant listing(s) ({skipped_title} skipped by title filter)")
-            if listings:
-                all_listings.extend(score_listings(listings, prompts))
-
-        except Exception as e:
-            print(f" ⚠️  ERROR")
-            warnings.append(f"<b>{name}</b> (Greenhouse): {e}")
-
-        time.sleep(0.5)
-
-    return all_listings, warnings
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SOURCE: HTML FALLBACK
-# For orgs without a public API. Works well on static pages (govt sites).
-# Workday/iCIMS/Taleo are JS-rendered and will return little text — flagged.
-# ══════════════════════════════════════════════════════════════════════════════
-
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -249,329 +106,263 @@ BROWSER_HEADERS = {
     )
 }
 
-def run_html(orgs: list[dict], prompts: dict, days: int = 3) -> tuple[list[dict], list[str], list[dict]]:
-    all_listings, warnings, also_ran_candidates = [], [], []
-
-    # HTML pages use a combined extract+score prompt from config
-    system_prompt = (
-        prompts.get("html_extract_system", "Extract and score job listings from this careers page.")
-        + "\n\nCANDIDATE PROFILE:\n"
-        + prompts.get("candidate_profile", "")
-    )
-    client = anthropic.Anthropic()
-
-    for org in orgs:
-        name       = org["name"]
-        if org.get("skip"):
-            print(f"  → {name} [skipped — JS-rendered]")
-            continue
-        verify_ssl = not org.get("skip_ssl_verify", False)
-
-        # Support both careers_url (single) and careers_urls (list) in config
-        raw_urls = org.get("careers_urls") or [org.get("careers_url", "")]
-        urls = [u for u in raw_urls if u]   # drop any empty strings
-
-        # Accumulate page text across all URLs for this org, then score in one Claude call
-        combined_text = ""
-        first_url     = urls[0] if urls else ""
-        url_labels    = []   # track which URL each chunk came from (for fallback links)
-
-        import urllib3
-        if not verify_ssl:
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-        for url in urls:
-            label = url.split("keyword=")[-1].replace("+", " ") if "keyword=" in url else url
-            print(f"  → {name} [{label}] ...", end="", flush=True)
-            try:
-                resp = requests.get(url, headers=BROWSER_HEADERS, timeout=15, verify=verify_ssl)
-                resp.raise_for_status()
-                soup = BeautifulSoup(resp.text, "html.parser")
-                for tag in soup(["script", "style", "nav", "footer", "header"]):
-                    tag.decompose()
-                page_text = soup.get_text(separator="\n", strip=True)
-
-                if len(page_text) < 500:
-                    warnings.append(
-                        f"<b>{name}</b> [{label}]: JS-rendered — little text returned. "
-                        f"&nbsp;<a href='{url}' style='color:#1a73e8;font-size:11px'>[open careers page]</a>"
-                    )
-                    print(f" ⚠️  JS-rendered")
-                    continue
-
-                chunk = page_text[:5000]   # per-URL cap; combined cap applied below
-                combined_text += f"\n\n--- Search: {label} | URL: {url} ---\n{chunk}"
-                url_labels.append((label, url))
-                print(f" ✓ ({len(chunk)} chars)")
-
-            except Exception as e:
-                print(f" ⚠️  ERROR")
-                warnings.append(
-                    f"<b>{name}</b> [{label}]: {e} "
-                    f"&nbsp;<a href='{url}' style='color:#1a73e8;font-size:11px'>[open careers page]</a>"
-                )
-            time.sleep(1)
-
-        if not combined_text.strip():
-            continue   # nothing fetched for this org
-
-        # Pre-flight quality check: skip Claude call if text looks like pure nav/boilerplate
-        JOB_SIGNALS = [
-            "apply", "job", "position", "role", "engineer", "analyst", "scientist",
-            "manager", "director", "remote", "salary", "full-time", "part-time",
-            "experience", "required", "qualifications", "responsibilities",
-            "opening", "hiring", "requisition", "posted", "vacancy",
-        ]
-        combined_lower = combined_text.lower()
-        signal_hits = sum(1 for w in JOB_SIGNALS if w in combined_lower)
-        if signal_hits < 2:
-            print(f"  ⏭  {name}: page looks like nav/boilerplate ({signal_hits} job signals) — skipping Claude call")
-            also_ran_candidates.append({"name": name, "url": first_url})
-            continue
-
-        # Single Claude call for all URLs combined (cap total at 12k chars)
-        try:
-            response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=2000,
-                system=system_prompt,
-                messages=[{
-                    "role": "user",
-                    "content": f"ORG: {name}\n\nCAREERS PAGE TEXT:{combined_text[:12000]}"
-                }]
-            )
-            raw = clean_json(response.content[0].text)
-            listings = json.loads(raw)
-            seen_titles = set()
-            deduped     = []
-            for l in listings:
-                # Deduplicate: same title can appear across multiple keyword searches
-                key = (l.get("title", "").lower().strip(), l.get("org", name).lower().strip())
-                if key in seen_titles:
-                    continue
-                seen_titles.add(key)
-                l["source"] = "html"
-                if not l.get("url"):
-                    l["url"]        = first_url
-                    l["url_direct"] = False
-                else:
-                    l["url_direct"] = True
-                deduped.append(l)
-
-            print(f"  ✅ {name}: {len(deduped)} listing(s) after dedup")
-            all_listings.extend(deduped)
-
-        except json.JSONDecodeError as e:
-            preview = raw[:120].replace("<", "&lt;").replace(">", "&gt;") if "raw" in dir() else "(no response)"
-            print(f"  ⚠️  {name}: non-JSON response — {preview!r}")
-            warnings.append(
-                f"<b>{name}</b>: Claude returned non-JSON (parse error: {e}). "
-                f"Response started with: <code>{preview}</code> "
-                f"&nbsp;<a href='{first_url}' style='color:#1a73e8;font-size:11px'>[open careers page]</a>"
-            )
-        except Exception as e:
-            print(f"  ⚠️  {name}: {e}")
-            warnings.append(
-                f"<b>{name}</b>: {e} "
-                f"&nbsp;<a href='{first_url}' style='color:#1a73e8;font-size:11px'>[open careers page]</a>"
-            )
-
-        time.sleep(1)
-
-    return all_listings, warnings, also_ran_candidates
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SOURCE: USAJOBS API  (DISABLED — uncomment in main() when key is ready)
-# To enable:
-#   1. Email access@usajobs.gov to request a free API key
-#   2. Add usajobs_api_key and usajobs_email to config.yaml
-#   3. Uncomment the usajobs block in main() — nothing else changes
-# ══════════════════════════════════════════════════════════════════════════════
-
-USAJOBS_BASE = "https://data.usajobs.gov/api/Search"
-
-def run_usajobs(cfg: dict, prompts: dict, days: int = 3) -> tuple[list[dict], list[str]]:
-    api_key = cfg.get("usajobs_api_key", "")
-    email   = cfg.get("usajobs_email", "")
-
-    if not api_key or api_key == "YOUR_USAJOBS_API_KEY":
-        return [], ["USAJobs: API key not configured — skipped."]
-
-    headers = {
-        "Host": "data.usajobs.gov",
-        "User-Agent": email,
-        "Authorization-Key": api_key,
-    }
-    seen_ids, raw_listings, warnings = set(), [], []
-
-    print("  → USAJobs API ...", end="", flush=True)
-    try:
-        for params in cfg.get("usajobs_searches", []):
-            query = {**params, "DatePosted": days, "ResultsPerPage": 25, "Fields": "min"}
-            try:
-                resp = requests.get(USAJOBS_BASE, headers=headers, params=query, timeout=15)
-                resp.raise_for_status()
-                for item in resp.json().get("SearchResult", {}).get("SearchResultItems", []):
-                    d      = item.get("MatchedObjectDescriptor", {})
-                    job_id = item.get("MatchedObjectId", "")
-                    if job_id in seen_ids:
-                        continue
-                    seen_ids.add(job_id)
-                    rem    = d.get("PositionRemuneration", [{}])
-                    s_min  = rem[0].get("MinimumRange", "") if rem else ""
-                    s_max  = rem[0].get("MaximumRange", "") if rem else ""
-                    locs   = d.get("PositionLocation", [{}])
-                    loc    = locs[0].get("LocationName", "Unknown") if locs else "Unknown"
-                    remote = "remote" in loc.lower()
-                    raw_listings.append({
-                        "source":   "usajobs_api",
-                        "org":      d.get("OrganizationName", d.get("DepartmentName", "Federal Agency")),
-                        "title":    d.get("PositionTitle", ""),
-                        "location": loc + (" [REMOTE]" if remote else ""),
-                        "salary":   f"${s_min}–${s_max}" if s_min and s_max else "Not listed",
-                        "posted":   d.get("PublicationStartDate", ""),
-                        "url":      d.get("PositionURI", ""),
-                    })
-                time.sleep(0.5)
-            except Exception as e:
-                warnings.append(f"USAJobs search error ({params.get('Keyword')}): {e}")
-
-        # Title filter — same keywords as Greenhouse, avoids scoring irrelevant roles
-        TITLE_KEYWORDS_USA = [
-            "data", "analyst", "engineer", "scientist", "analytics",
-            "machine learning", "intelligence", "python", "cloud", "etl",
-            "pipeline", "meteorolog", "climate", "weather", "atmospheric",
-            "research", "snowflake", "sql", "information technology",
-            "operations research", "physical scientist", "geospatial",
-        ]
-        filtered = [l for l in raw_listings if any(
-            kw in l.get("title", "").lower() for kw in TITLE_KEYWORDS_USA
-        )]
-        skipped_title = len(raw_listings) - len(filtered)
-        print(f" {len(raw_listings)} listing(s) found → {len(filtered)} after title filter ({skipped_title} skipped)")
-        if not filtered:
-            return [], warnings
-        scored = score_listings(filtered, prompts)
-        return scored, warnings
-
-    except Exception as e:
-        print(f" ⚠️  ERROR")
-        return [], [f"USAJobs source crashed: {e}"]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SEEN-JOBS LOG  (seen_jobs.json)
-# Tracks every job that has been emailed so it is never repeated in future runs.
-# Key: "<org>|<title>" lowercased — simple and readable in the JSON file.
-# ══════════════════════════════════════════════════════════════════════════════
-
-SEEN_LOG = "seen_jobs.json"
-
-def seen_key(job: dict) -> str:
-    org   = job.get("org", "").lower().strip()
-    title = job.get("title", "").lower().strip()
-    return f"{org}|{title}"
-
-
-def load_seen(path: str = SEEN_LOG) -> dict:
-    """Return {key: {first_seen, title, org}} from the log file."""
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_seen(seen: dict, emailed: list[dict], run_date: str, path: str = SEEN_LOG):
-    """Add newly emailed jobs to the log and write it back to disk."""
-    for job in emailed:
-        k = seen_key(job)
-        if k not in seen:
-            seen[k] = {
-                "first_seen": run_date,
-                "title":      job.get("title", ""),
-                "org":        job.get("org", ""),
-            }
-    with open(path, "w") as f:
-        json.dump(seen, f, indent=2)
-    print(f"  Seen-jobs log updated -> {len(seen)} total entries ({path})")
-
-
-def filter_seen(listings: list[dict], seen: dict) -> tuple[list[dict], int]:
-    """Remove listings already in the seen log. Returns (fresh_listings, skipped_count)."""
-    fresh   = [l for l in listings if seen_key(l) not in seen]
-    skipped = len(listings) - len(fresh)
-    return fresh, skipped
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RANKING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def select_top_n(listings: list[dict], n: int = 5, max_per_org: int = 3) -> list[dict]:
-    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    # Exclude zero-score entries and placeholder "no listings found" results
-    eligible = [
-        l for l in listings
-        if l.get("fit_score", 0) > 10
-        and "no specific listings" not in l.get("title", "").lower()
-        and "no listings" not in l.get("title", "").lower()
-    ]
-    eligible.sort(key=lambda x: (
-        order.get(x.get("priority", "LOW"), 2),
-        -x.get("fit_score", 0)
-    ))
-    # Cap at max_per_org per organization
-    org_counts: dict[str, int] = {}
-    result = []
-    for job in eligible:
-        org = job.get("org", "").lower().strip()
-        if org_counts.get(org, 0) < max_per_org:
-            result.append(job)
-            org_counts[org] = org_counts.get(org, 0) + 1
-        if len(result) >= n:
-            break
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EMAIL
-# ══════════════════════════════════════════════════════════════════════════════
-
 SOURCE_BADGES = {
-    "greenhouse_api": "🌿 Greenhouse",
-    "html":           "🌐 Web",
-    "usajobs_api":    "🏛️ USAJobs",
+    "greenhouse": "🌿 Greenhouse",
+    "html": "🌐 Web",
+    "usajobs": "🏛️ USAJobs",
 }
 
-def build_email(top: list[dict], warnings: list[str], run_date: str,
-               also_ran: list[dict] | None = None) -> str:
-    """
-    also_ran: list of {name, url} dicts — orgs that scraped cleanly but
-              whose listings didn't make the top-N cut. Shown as browse links.
-    """
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL IMPLEMENTATIONS  — called by the agent loop when Claude invokes a tool
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def tool_list_orgs(cfg: dict) -> dict:
+    """Return all configured orgs so the agent can plan its search strategy."""
+    greenhouse = [
+        {
+            "name": o["name"],
+            "type": "greenhouse",
+            "board_token": o["board_token"],
+        }
+        for o in cfg.get("greenhouse_orgs", [])
+    ]
+    html = [
+        {
+            "name": o["name"],
+            "type": "html",
+            "urls": o.get("careers_urls") or [o.get("careers_url", "")],
+            "skip": o.get("skip", False),
+        }
+        for o in cfg.get("html_orgs", [])
+    ]
+    api_key = cfg.get("usajobs_api_key", "")
+    usajobs_ready = bool(api_key and api_key != "YOUR_USAJOBS_API_KEY")
+    return {
+        "greenhouse_orgs": greenhouse,
+        "html_orgs": html,
+        "usajobs_available": usajobs_ready,
+        "usajobs_keywords": (
+            [s.get("Keyword") for s in cfg.get("usajobs_searches", [])]
+            if usajobs_ready
+            else []
+        ),
+        "total_orgs": len(greenhouse) + len(html),
+    }
+
+
+def tool_fetch_greenhouse(
+    board_token: str, org_name: str, seen: dict, days: int = 3
+) -> dict:
+    """Fetch recent job listings from a Greenhouse ATS board."""
+    TITLE_KW = [
+        "data",
+        "analyst",
+        "engineer",
+        "scientist",
+        "analytics",
+        "machine learning",
+        "ml",
+        "ai",
+        "intelligence",
+        "python",
+        "cloud",
+        "etl",
+        "pipeline",
+        "meteorolog",
+        "climate",
+        "weather",
+        "atmospheric",
+        "research",
+        "snowflake",
+        "sql",
+    ]
+    try:
+        resp = requests.get(
+            f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs",
+            params={"content": "true"},
+            timeout=15,
+        )
+        if resp.status_code == 404:
+            return {"error": f"Board token '{board_token}' not found", "org": org_name}
+        resp.raise_for_status()
+        all_jobs = resp.json().get("jobs", [])
+
+        listings = []
+        for job in all_jobs:
+            title = job.get("title", "").lower()
+            if not any(kw in title for kw in TITLE_KW):
+                continue
+            date = job.get("created_at") or job.get("updated_at") or ""
+            if date and not is_recent(date, days):
+                continue
+            listing = {
+                "org": org_name,
+                "title": job.get("title", ""),
+                "location": job.get("location", {}).get("name", "Unknown"),
+                "salary": "Not listed",
+                "posted": date,
+                "url": job.get("absolute_url", ""),
+                "source": "greenhouse",
+                "already_seen": seen_key(
+                    {"org": org_name, "title": job.get("title", "")}
+                )
+                in seen,
+            }
+            listings.append(listing)
+
+        return {
+            "org": org_name,
+            "listings": listings,
+            "total_on_board": len(all_jobs),
+            "after_filters": len(listings),
+        }
+    except Exception as e:
+        return {"error": str(e), "org": org_name}
+
+
+def tool_fetch_html(org_name: str, urls: list[str], seen: dict) -> dict:
+    """Fetch and parse HTML careers pages, returning raw text for Claude to analyze."""
+    JOB_SIGNALS = [
+        "apply",
+        "job",
+        "position",
+        "role",
+        "engineer",
+        "analyst",
+        "scientist",
+        "manager",
+        "director",
+        "remote",
+        "salary",
+        "full-time",
+        "experience",
+        "required",
+        "qualifications",
+        "responsibilities",
+        "opening",
+        "hiring",
+    ]
+    combined_text = ""
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            page_text = soup.get_text(separator="\n", strip=True)
+            if len(page_text) < 500:
+                combined_text += f"\n[JS-rendered — little text from {url}]"
+            else:
+                combined_text += f"\n--- URL: {url} ---\n{page_text[:4000]}"
+        except Exception as e:
+            combined_text += f"\n[Error fetching {url}: {e}]"
+        time.sleep(0.5)
+
+    if not combined_text.strip():
+        return {"error": "No text fetched", "org": org_name}
+
+    signal_hits = sum(1 for w in JOB_SIGNALS if w in combined_text.lower())
+    if signal_hits < 2:
+        return {
+            "org": org_name,
+            "note": f"Page looks like nav/boilerplate ({signal_hits} job signals) — likely no listings",
+            "raw_text": None,
+        }
+
+    # Mark any titles in the text that are already seen (best-effort hint)
+    seen_hint = [k.split("|")[1] for k in seen if k.startswith(org_name.lower())]
+    return {
+        "org": org_name,
+        "raw_text": combined_text[:10000],
+        "first_url": urls[0] if urls else "",
+        "already_seen_titles": seen_hint[:10],  # hint so agent can skip duplicates
+    }
+
+
+def tool_fetch_usajobs(keyword: str, cfg: dict, seen: dict, days: int = 3) -> dict:
+    """Search USAJobs for federal positions matching a keyword."""
+    api_key = cfg.get("usajobs_api_key", "")
+    email = cfg.get("usajobs_email", "")
+    if not api_key or api_key == "YOUR_USAJOBS_API_KEY":
+        return {"error": "USAJobs API key not configured — skipping"}
+    try:
+        resp = requests.get(
+            "https://data.usajobs.gov/api/Search",
+            headers={
+                "Host": "data.usajobs.gov",
+                "User-Agent": email,
+                "Authorization-Key": api_key,
+            },
+            params={
+                "Keyword": keyword,
+                "DatePosted": days,
+                "ResultsPerPage": 25,
+                "Fields": "min",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        listings = []
+        for item in resp.json().get("SearchResult", {}).get("SearchResultItems", []):
+            d = item.get("MatchedObjectDescriptor", {})
+            rem = d.get("PositionRemuneration", [{}])
+            locs = d.get("PositionLocation", [{}])
+            s_min, s_max = (
+                (rem[0].get("MinimumRange", ""), rem[0].get("MaximumRange", ""))
+                if rem
+                else ("", "")
+            )
+            org_name = d.get(
+                "OrganizationName", d.get("DepartmentName", "Federal Agency")
+            )
+            title = d.get("PositionTitle", "")
+            listing = {
+                "org": org_name,
+                "title": title,
+                "location": (
+                    locs[0].get("LocationName", "Unknown") if locs else "Unknown"
+                ),
+                "salary": f"${s_min}–${s_max}" if s_min and s_max else "Not listed",
+                "posted": d.get("PublicationStartDate", ""),
+                "url": d.get("PositionURI", ""),
+                "source": "usajobs",
+                "already_seen": seen_key({"org": org_name, "title": title}) in seen,
+            }
+            listings.append(listing)
+        return {"keyword": keyword, "listings": listings}
+    except Exception as e:
+        return {"error": str(e), "keyword": keyword}
+
+
+def tool_send_report(
+    jobs: list[dict], summary: str, cfg: dict, run_date: str, dry_run: bool
+) -> dict:
+    """Build an HTML report and email it (or print it in dry-run mode)."""
     rows = ""
-    for i, job in enumerate(top, 1):
-        url        = job.get("url", "")
-        url_direct = job.get("url_direct", True)   # False when url is a fallback careers page
-        link_label = "Apply →" if url_direct else "Careers page →"
-        link  = f'<a href="{url}" style="color:#2980b9;white-space:nowrap">{link_label}</a>' if url else "—"
-        flags = (f'<br><span style="color:#c0392b;font-size:11px">⚑ {job["flags"]}</span>'
-                 if job.get("flags") else "")
+    for i, job in enumerate(jobs, 1):
+        url = job.get("url", "")
+        link = f'<a href="{url}" style="color:#2980b9">Apply →</a>' if url else "—"
         score = job.get("fit_score", 0)
-        sc    = "#27ae60" if score >= 75 else "#e67e22" if score >= 50 else "#c0392b"
-        pri   = job.get("priority", "?")
-        pc    = {"HIGH": "#27ae60", "MEDIUM": "#e67e22"}.get(pri, "#95a5a6")
+        sc = "#27ae60" if score >= 75 else "#e67e22" if score >= 50 else "#c0392b"
+        pri = job.get("priority", "?")
+        pc = {"HIGH": "#27ae60", "MEDIUM": "#e67e22"}.get(pri, "#95a5a6")
         badge = SOURCE_BADGES.get(job.get("source", "html"), "🌐 Web")
-        gap   = job.get("skills_gap", "") or ""
+        gap = job.get("skills_gap", "") or ""
         gap_html = ""
-        if gap and gap.strip() and gap.strip().lower() not in ("none", "—", "-", ""):
+        if gap.strip() and gap.strip().lower() not in ("none", "—", "-", ""):
             gap_html = (
                 f'<div style="margin-top:7px;padding:5px 8px;background:#fff8e1;'
                 f'border-left:3px solid #f39c12;border-radius:3px;font-size:11px;color:#7d6608">'
-                f'<strong>Gap:</strong> {gap}</div>'
+                f"<strong>Gap:</strong> {gap}</div>"
             )
+        flags_html = (
+            f'<br><span style="color:#c0392b;font-size:11px">⚑ {job["flags"]}</span>'
+            if job.get("flags")
+            else ""
+        )
         rows += f"""
         <tr style="background:{'#f9fbff' if i%2 else '#fff'}">
           <td style="padding:11px;font-weight:bold;color:#2c3e50">#{i}</td>
@@ -589,11 +380,12 @@ def build_email(top: list[dict], warnings: list[str], run_date: str,
             <span style="background:{pc};color:white;padding:3px 9px;border-radius:12px;font-size:12px">{pri}</span>
           </td>
           <td style="padding:11px;font-size:12px;white-space:nowrap">{str(job.get('posted',''))[:10] or '?'}</td>
-          <td style="padding:11px;font-size:12px;color:#444">{job.get('rationale','')}{flags}{gap_html}</td>
+          <td style="padding:11px;font-size:12px;color:#444">{job.get('rationale','')}{flags_html}{gap_html}</td>
           <td style="padding:11px">{link}</td>
         </tr>"""
 
-    table = f"""
+    table = (
+        f"""
     <table style="width:100%;border-collapse:collapse">
       <thead style="background:#2c3e50;color:white">
         <tr>
@@ -609,222 +401,408 @@ def build_email(top: list[dict], warnings: list[str], run_date: str,
         </tr>
       </thead>
       <tbody>{rows}</tbody>
-    </table>""" if top else """
+    </table>"""
+        if jobs
+        else """
     <div style="padding:30px;text-align:center;color:#888;background:#f9f9f9;border-radius:8px">
       No matching listings found today. Try again tomorrow or add more orgs to config.yaml.
     </div>"""
+    )
 
-    warn_block = ""
-    if warnings:
-        items = "".join(f"<li style='margin:4px 0'>{w}</li>" for w in warnings)
-        warn_block = f"""
-        <div style="margin-top:24px;padding:14px;background:#fff8e1;
-                    border-left:4px solid #f39c12;border-radius:4px">
-          <strong>⚠️ Warnings (check these manually):</strong>
-          <ul style="margin:8px 0 0 0">{items}</ul>
-        </div>"""
-
-    also_ran_block = ""
-    if also_ran:
-        links = ""
-        for entry in sorted(also_ran, key=lambda x: x["name"]):
-            links += (
-                f'<a href="{entry["url"]}" style="display:inline-block;margin:4px 6px;' +
-                f'padding:5px 12px;background:#eaf0fb;border:1px solid #c5d5ef;' +
-                f'border-radius:14px;color:#2471a3;font-size:12px;text-decoration:none">' +
-                f'{entry["name"]} →</a>'
-            )
-        also_ran_block = f"""
-        <div style="margin-top:24px;padding:16px;background:white;border-radius:8px;
-                    box-shadow:0 1px 3px rgba(0,0,0,.08)">
-          <strong style="color:#2c3e50;font-size:13px">
-            🔍 Also checked — no top matches, but scraped cleanly. Browse manually if interested:
-          </strong>
-          <div style="margin-top:10px;line-height:2">{links}</div>
-        </div>"""
-
-    return f"""
+    html = f"""
     <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
                        max-width:1050px;margin:auto;padding:24px;background:#f5f7fa">
       <div style="background:white;border-radius:8px;padding:24px;
                   box-shadow:0 1px 3px rgba(0,0,0,.1)">
-        <h2 style="color:#2c3e50;margin-top:0">🎯 Job Hunt Results — {run_date}</h2>
+        <h2 style="color:#2c3e50;margin-top:0">🤖 Agentic Job Hunt — {run_date}</h2>
+        <p style="color:#555;font-style:italic;margin-bottom:16px;padding:10px 14px;
+                  background:#f0f4ff;border-left:4px solid #4a6fa5;border-radius:4px">
+          Agent summary: {summary}
+        </p>
         <p style="color:#666;margin-bottom:20px">
-          Top matches (≤3 days old where verifiable) ·
           Filters: remote/hybrid Loudoun Co. VA · $120K+ · no on-call · no sales/marketing
         </p>
         {table}
       </div>
-      {also_ran_block}
-      {warn_block}
       <p style="color:#bbb;font-size:11px;text-align:center;margin-top:16px">
         Job Hunter Agent · {run_date}
       </p>
     </body></html>"""
 
+    if dry_run:
+        print("\n" + "─" * 60)
+        print("DRY RUN — email not sent. Jobs the agent selected:")
+        for i, j in enumerate(jobs, 1):
+            print(
+                f"  {i}. [{j.get('priority','?')} / {j.get('fit_score',0)}] "
+                f"{j.get('title','')} @ {j.get('org','')} — {j.get('location','')}"
+            )
+        print("─" * 60)
+        return {"status": "dry_run", "job_count": len(jobs)}
 
-def send_email(html: str, cfg: dict, run_date: str):
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🎯 Job Hunt — {run_date}"
-    msg["From"]    = cfg["email"]["from"]
-    msg["To"]      = cfg["email"]["to"]
+    msg["Subject"] = f"🤖 Agentic Job Hunt — {run_date}"
+    msg["From"] = cfg["email"]["from"]
+    msg["To"] = cfg["email"]["to"]
     msg.attach(MIMEText(html, "html"))
     with smtplib.SMTP_SSL(cfg["email"]["smtp_host"], cfg["email"]["smtp_port"]) as s:
         s.login(cfg["email"]["username"], cfg["email"]["password"])
         s.sendmail(cfg["email"]["from"], cfg["email"]["to"], msg.as_string())
-    print("✅ Email sent.")
+    return {"status": "sent", "recipient": cfg["email"]["to"], "job_count": len(jobs)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL SCHEMAS  — passed to Claude so it knows what tools are available
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOOLS = [
+    {
+        "name": "list_orgs",
+        "description": (
+            "List all configured employers with their type (greenhouse, html, or usajobs). "
+            "Call this first to plan your search strategy."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "fetch_greenhouse_jobs",
+        "description": (
+            "Fetch recent job listings from a Greenhouse ATS board. "
+            "Returns structured listings with title, location, URL, and posted date. "
+            "Listings already emailed to the user are flagged with already_seen=true — skip those."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "board_token": {
+                    "type": "string",
+                    "description": "Greenhouse board token from list_orgs",
+                },
+                "org_name": {
+                    "type": "string",
+                    "description": "Human-readable org name",
+                },
+            },
+            "required": ["board_token", "org_name"],
+        },
+    },
+    {
+        "name": "fetch_html_jobs",
+        "description": (
+            "Fetch HTML careers pages for an org and return raw page text. "
+            "You must extract and score the job listings yourself from the raw_text field. "
+            "already_seen_titles lists titles previously emailed — skip those when extracting."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "org_name": {
+                    "type": "string",
+                    "description": "Human-readable org name",
+                },
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Careers page URLs (from list_orgs)",
+                },
+            },
+            "required": ["org_name", "urls"],
+        },
+    },
+    {
+        "name": "fetch_usajobs",
+        "description": (
+            "Search USAJobs for federal positions matching a keyword. "
+            "Call once per keyword. Returns structured listings."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "Search keyword e.g. 'data engineer'",
+                },
+            },
+            "required": ["keyword"],
+        },
+    },
+    {
+        "name": "send_report",
+        "description": (
+            "Build an HTML email and send the final job report. "
+            "Call when you have reached the HIGH-priority target or exhausted all sources. "
+            "Pass only non-already_seen listings, scored and ranked best-first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "jobs": {
+                    "type": "array",
+                    "description": "Scored, ranked job listings to include (best first)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "org": {"type": "string"},
+                            "title": {"type": "string"},
+                            "location": {"type": "string"},
+                            "salary": {"type": "string"},
+                            "posted": {"type": "string"},
+                            "url": {"type": "string"},
+                            "source": {
+                                "type": "string",
+                                "enum": ["greenhouse", "html", "usajobs"],
+                            },
+                            "fit_score": {
+                                "type": "number",
+                                "description": "0-100 fit score",
+                            },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["HIGH", "MEDIUM", "LOW"],
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": "1-2 sentence fit explanation",
+                            },
+                            "skills_gap": {
+                                "type": "string",
+                                "description": "Key gaps, or empty string",
+                            },
+                            "flags": {
+                                "type": "string",
+                                "description": "Disqualifiers, or empty string",
+                            },
+                        },
+                        "required": [
+                            "org",
+                            "title",
+                            "location",
+                            "url",
+                            "source",
+                            "fit_score",
+                            "priority",
+                            "rationale",
+                        ],
+                    },
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "2-3 sentence summary of search strategy, orgs checked, and what you found",
+                },
+            },
+            "required": ["jobs", "summary"],
+        },
+    },
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENT LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def run_agent(cfg: dict, target_n: int, seen: dict, run_date: str, dry_run: bool):
+    client = anthropic.Anthropic()
+    prompts = cfg.get("prompts", {})
+    profile = prompts.get("candidate_profile", "")
+    scoring = prompts.get("score_system", "")
+
+    system_prompt = f"""You are an autonomous job hunting agent. Your mission: find {target_n} HIGH-priority \
+job listings for the candidate below, then send a report.
+
+CANDIDATE PROFILE:
+{profile}
+
+SCORING RULES:
+{scoring}
+
+HOW TO WORK:
+1. Call list_orgs to see all configured sources.
+2. Choose an efficient search order — start with Greenhouse orgs (structured data, fast), \
+then HTML orgs, then USAJobs keywords.
+3. For each Greenhouse or USAJobs result: score every listing you receive directly.
+4. For each HTML result: extract listings from raw_text, then score them.
+5. Skip any listing where already_seen=true or title appears in already_seen_titles.
+6. Track your HIGH-priority count. Once you hit {target_n} fresh HIGH results, \
+call send_report immediately — don't keep searching.
+7. If you exhaust all sources before reaching {target_n}, call send_report with whatever you found.
+
+SCORING SCALE: fit_score 0-100. HIGH ≥ 70, MEDIUM 40-69, LOW < 40. \
+Violate any hard non-negotiable → fit_score ≤ 15, priority = LOW.
+
+Be decisive. Never ask for confirmation. Search → score → report."""
+
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                f"Start the job hunt. Find {target_n} HIGH-priority listings and send the report. "
+                f"Today is {run_date}."
+            ),
+        }
+    ]
+
+    print(f"\n🤖 Agent starting — target: {target_n} HIGH-priority results\n{'─'*50}")
+
+    report_sent = False
+    final_jobs = []
+
+    for iteration in range(MAX_ITERS):
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        # Log any text blocks the agent emits (its reasoning)
+        for block in response.content:
+            if block.type == "text" and block.text.strip():
+                # Indent and truncate for readability
+                preview = block.text.strip()[:300].replace("\n", "\n  ")
+                print(f"\n  💭 {preview}{'…' if len(block.text) > 300 else ''}")
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "end_turn":
+            print("\n✅ Agent finished (end_turn).")
+            break
+
+        if response.stop_reason != "tool_use":
+            print(f"\n⚠️  Unexpected stop_reason: {response.stop_reason}")
+            break
+
+        # Execute each tool call
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            name = block.name
+            inp = block.input
+            label = ", ".join(f"{k}={repr(v)[:50]}" for k, v in inp.items())
+            print(f"\n  🔧 {name}({label})")
+
+            if name == "list_orgs":
+                result = tool_list_orgs(cfg)
+                print(
+                    f"     → {result['total_orgs']} orgs ({len(result['greenhouse_orgs'])} Greenhouse, "
+                    f"{len(result['html_orgs'])} HTML, USAJobs={'yes' if result['usajobs_available'] else 'no'})"
+                )
+
+            elif name == "fetch_greenhouse_jobs":
+                result = tool_fetch_greenhouse(
+                    inp["board_token"], inp["org_name"], seen
+                )
+                n_new = sum(
+                    1 for l in result.get("listings", []) if not l.get("already_seen")
+                )
+                print(
+                    f"     → {len(result.get('listings', []))} listing(s) ({n_new} new)"
+                )
+
+            elif name == "fetch_html_jobs":
+                result = tool_fetch_html(inp["org_name"], inp["urls"], seen)
+                if result.get("raw_text"):
+                    print(f"     → {len(result['raw_text'])} chars fetched")
+                else:
+                    print(
+                        f"     → {result.get('note', result.get('error', 'no content'))}"
+                    )
+
+            elif name == "fetch_usajobs":
+                result = tool_fetch_usajobs(inp["keyword"], cfg, seen)
+                n_new = sum(
+                    1 for l in result.get("listings", []) if not l.get("already_seen")
+                )
+                print(
+                    f"     → {len(result.get('listings', []))} listing(s) ({n_new} new)"
+                )
+
+            elif name == "send_report":
+                result = tool_send_report(
+                    inp["jobs"], inp["summary"], cfg, run_date, dry_run
+                )
+                final_jobs = inp["jobs"]
+                status = result.get("status")
+                print(f"     → {result['job_count']} job(s) — status: {status}")
+                report_sent = True
+
+            else:
+                result = {"error": f"Unknown tool: {name}"}
+
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result),
+                }
+            )
+
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+
+        if report_sent:
+            break
+
+    else:
+        print(f"\n⚠️  Safety limit reached ({MAX_ITERS} iterations).")
+
+    return final_jobs, report_sent
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def main():
     parser = argparse.ArgumentParser(description="Job Hunter Agent")
     parser.add_argument(
-        "-n", "--results",
+        "-n",
+        "--results",
         type=int,
-        default=10,
+        default=5,
         metavar="N",
-        help="Number of top listings to return (default: 10)"
+        help="Stop after finding N HIGH-priority fresh listings (default: 5)",
     )
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Clear the seen-jobs log before running (re-surfaces all previously seen listings)"
+        help="Clear the seen-jobs log before running (re-surfaces all listings)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Search and score but print results instead of sending email",
     )
     args = parser.parse_args()
 
-    cfg      = load_config()
-    prompts  = cfg.get("prompts", {})
+    cfg = load_config()
     run_date = datetime.now().strftime("%Y-%m-%d %I:%M %p")
 
-    # Set Anthropic API key
     api_key = cfg.get("anthropic_api_key", "ENV")
     if api_key != "ENV":
         os.environ["ANTHROPIC_API_KEY"] = api_key
 
-    print(f"\n🔍 Job Hunter Agent — {run_date}\n")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit(
+            "❌ ANTHROPIC_API_KEY not set — add it to keys.yaml or your environment."
+        )
 
-    # ── Seen-jobs log ─────────────────────────────────────────────────────────
+    seen = {} if args.reset else load_seen()
     if args.reset:
-        seen = {}
-        print("🗑️  Seen-jobs log cleared (--reset)\n")
+        print("🗑️  Seen-jobs log cleared (--reset)")
     else:
-        seen = load_seen()
-        print(f"📋 Seen-jobs log: {len(seen)} previously emailed listings will be skipped\n")
+        print(f"📋 Seen-jobs log: {len(seen)} previously seen listings will be skipped")
 
-    all_listings: list[dict] = []
-    all_warnings: list[str]  = []
+    final_jobs, sent = run_agent(cfg, args.results, seen, run_date, args.dry_run)
 
-    # ── Greenhouse API ────────────────────────────────────────────────────────
-    # Each source wrapped in try/except so one failure never kills the others.
-    gh_orgs = cfg.get("greenhouse_orgs", [])
-    if gh_orgs:
-        print("[ Greenhouse API ]")
-        try:
-            listings, warnings = run_greenhouse(gh_orgs, prompts, days=3)
-            all_listings.extend(listings)
-            all_warnings.extend(warnings)
-        except Exception as e:
-            print(f"  💥 Greenhouse source crashed unexpectedly: {e}")
-            all_warnings.append(f"Greenhouse source crashed: {e}")
-        print()
+    if sent and not args.dry_run and final_jobs:
+        save_seen(seen, final_jobs, run_date)
 
-    # ── HTML fallback ─────────────────────────────────────────────────────────
-    html_orgs = cfg.get("html_orgs", [])
-    all_html_also_ran: list[dict] = []
-    if html_orgs:
-        print("[ Web (HTML) ]")
-        try:
-            listings, warnings, html_also_ran = run_html(html_orgs, prompts, days=3)
-            all_listings.extend(listings)
-            all_warnings.extend(warnings)
-            all_html_also_ran.extend(html_also_ran)
-        except Exception as e:
-            print(f"  💥 HTML source crashed unexpectedly: {e}")
-            all_warnings.append(f"HTML source crashed: {e}")
-        print()
-
-    # ── USAJobs API ───────────────────────────────────────────────────────────
-    print("[ USAJobs API ]")
-    try:
-        listings, warnings = run_usajobs(cfg, prompts, days=3)
-        all_listings.extend(listings)
-        all_warnings.extend(warnings)
-    except Exception as e:
-        print(f"  💥 USAJobs source crashed unexpectedly: {e}")
-        all_warnings.append(f"USAJobs source crashed: {e}")
-    print()
-
-    # ── Filter seen, rank, send ───────────────────────────────────────────────
-    fresh, skipped = filter_seen(all_listings, seen)
-    print(f"📊 Total evaluated: {len(all_listings)}  |  Already seen: {skipped}  |  Fresh: {len(fresh)}")
-
-    max_per_org = cfg.get("settings", {}).get("max_results_per_org", 3)
-    top_n = select_top_n(fresh, n=args.results, max_per_org=max_per_org)
-    print(f"   Top {len(top_n)} selected")
-
-    if not top_n:
-        print("   Nothing new to email — all listings already seen. Run with --reset to resurface.")
-        return
-
-    # ── Also-ran: orgs that scraped cleanly but didn't crack top N ──────────
-    # Collect the org name of every listing that made it into top_n
-    top_orgs = {j.get("org", "").lower().strip() for j in top_n}
-
-    # Collect org names mentioned in any warning (they had errors — exclude)
-    warned_orgs = set()
-    for w in all_warnings:
-        # Warnings are HTML like "<b>Org Name</b>: ..." — extract the bold text
-        import re as _re
-        for match in _re.findall(r"<b>(.*?)</b>", w):
-            warned_orgs.add(match.lower().strip())
-
-    # Build {org_name: first_url} from every listing that was evaluated
-    org_urls: dict[str, str] = {}
-    for job in all_listings:
-        org = job.get("org", "").strip()
-        if org and org not in org_urls:
-            org_urls[org] = job.get("url", "")
-
-    # Also include orgs from config that produced no listings at all but had no warning
-    # (they may have had all listings filtered by seen-log; still worth a browse link)
-    all_config_orgs: list[dict] = []
-    for o in cfg.get("html_orgs", []):
-        urls = o.get("careers_urls") or [o.get("careers_url", "")]
-        all_config_orgs.append({"name": o["name"], "url": urls[0] if urls else ""})
-    for o in cfg.get("greenhouse_orgs", []):
-        all_config_orgs.append({
-            "name": o.get("name", o.get("board_token", "")),
-            "url":  f"https://boards.greenhouse.io/{o.get('board_token', '')}"
-        })
-
-    also_ran: list[dict] = []
-    seen_also = set()
-    # Seed with orgs flagged as boilerplate during HTML scraping
-    for entry in all_html_also_ran:
-        name_lc = entry["name"].lower().strip()
-        if name_lc not in seen_also and entry.get("url"):
-            also_ran.append(entry)
-            seen_also.add(name_lc)
-    for entry in all_config_orgs:
-        name_lc = entry["name"].lower().strip()
-        if (name_lc not in top_orgs
-                and name_lc not in warned_orgs
-                and name_lc not in seen_also
-                and entry["url"]):
-            also_ran.append(entry)
-            seen_also.add(name_lc)
-
-    print(f"   Also-ran orgs (clean, below cut): {len(also_ran)}")
-
-    print("   Sending email ...")
-    html = build_email(top_n, all_warnings, run_date, also_ran=also_ran)
-    send_email(html, cfg, run_date)
-
-    save_seen(seen, top_n, run_date)
-    print("🏁 Done.\n")
+    print("\n🏁 Done.\n")
 
 
 if __name__ == "__main__":

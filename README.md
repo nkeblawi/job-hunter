@@ -4,6 +4,8 @@ Scans 62 employer career pages daily, scores every listing against your profile
 using Claude, and emails you the top N results with fit score, rationale, and a
 concrete skills gap for each role.
 
+![Sample Email Result](images/email_example.jpg)
+
 ---
 
 ## Quick Start
