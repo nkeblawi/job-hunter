@@ -9,8 +9,8 @@ concrete skills gap for each role.
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+# 1. Activate the virtual environment (contains all required dependencies)
+source jh/bin/activate
 
 # 2. Fill in config.yaml (see Configuration below)
 

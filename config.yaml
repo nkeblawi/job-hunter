@@ -165,6 +165,33 @@ prompts:
 settings:
   max_results_per_org: 3    # Max listings from any single org in the email
 
+# ── USAJobs API searches ──────────────────────────────────────────────────────
+# Keys map directly to USAJobs API query params (Keyword, LocationName,
+# RemoteIndicator, Organization). Add/remove entries freely here.
+# Agency codes: CM=NOAA, GS=USGS, EP=EPA, NN=NASA, EN=DOE
+
+usajobs_searches:
+  # General keyword + location searches (all agencies)
+  - {Keyword: "data engineer",             LocationName: "Virginia"}
+  - {Keyword: "data engineer",             LocationName: "Washington DC"}
+  - {Keyword: "data engineer",             RemoteIndicator: "True"}
+  - {Keyword: "data scientist",            LocationName: "Virginia"}
+  - {Keyword: "data scientist",            LocationName: "Washington DC"}
+  - {Keyword: "data scientist",            RemoteIndicator: "True"}
+  - {Keyword: "meteorologist",             LocationName: "Virginia"}
+  - {Keyword: "machine learning engineer", RemoteIndicator: "True"}
+  - {Keyword: "business intelligence",     LocationName: "Virginia"}
+  - {Keyword: "analytics engineer",        RemoteIndicator: "True"}
+  - {Keyword: "research scientist data",   LocationName: "Virginia"}
+  # NOAA (agency code CM)
+  - {Keyword: "physical scientist",        Organization: "CM"}
+  - {Keyword: "meteorologist",             Organization: "CM"}
+  - {Keyword: "information technology",    Organization: "CM"}
+  # USGS (agency code GS)
+  - {Keyword: "physical scientist",        Organization: "GS"}
+  - {Keyword: "information technology",    Organization: "GS"}
+  - {Keyword: "operations research",       Organization: "GS"}
+
 greenhouse_orgs:
 
   - name: "Accenture Federal Services"

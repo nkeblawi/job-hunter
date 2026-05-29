@@ -389,26 +389,7 @@ def run_html(orgs: list[dict], prompts: dict, days: int = 3) -> tuple[list[dict]
 #   3. Uncomment the usajobs block in main() — nothing else changes
 # ══════════════════════════════════════════════════════════════════════════════
 
-USAJOBS_BASE    = "https://data.usajobs.gov/api/Search"
-USAJOBS_SEARCHES = [
-    {"Keyword": "data engineer",             "LocationName": "Virginia",     "RemoteIndicator": "True"},
-    {"Keyword": "data scientist",            "LocationName": "Virginia",     "RemoteIndicator": "True"},
-    {"Keyword": "data engineer",             "LocationName": "Washington DC"},
-    {"Keyword": "data scientist",            "LocationName": "Washington DC"},
-    {"Keyword": "meteorologist",             "LocationName": "Virginia"},
-    {"Keyword": "machine learning engineer", "RemoteIndicator": "True"},
-    {"Keyword": "business intelligence",     "LocationName": "Virginia"},
-    {"Keyword": "analytics engineer",        "RemoteIndicator": "True"},
-    {"Keyword": "research scientist data",   "LocationName": "Virginia"},
-    # NOAA (agency code CM) — replaces HTML scraping of usajobs search pages
-    {"Keyword": "physical scientist",        "Organization": "CM"},
-    {"Keyword": "meteorologist",             "Organization": "CM"},
-    {"Keyword": "information technology",    "Organization": "CM"},
-    # USGS (agency code GS) — replaces HTML scraping of usajobs search pages
-    {"Keyword": "physical scientist",        "Organization": "GS"},
-    {"Keyword": "information technology",    "Organization": "GS"},
-    {"Keyword": "operations research",       "Organization": "GS"},
-]
+USAJOBS_BASE = "https://data.usajobs.gov/api/Search"
 
 def run_usajobs(cfg: dict, prompts: dict, days: int = 3) -> tuple[list[dict], list[str]]:
     api_key = cfg.get("usajobs_api_key", "")
@@ -426,7 +407,7 @@ def run_usajobs(cfg: dict, prompts: dict, days: int = 3) -> tuple[list[dict], li
 
     print("  → USAJobs API ...", end="", flush=True)
     try:
-        for params in USAJOBS_SEARCHES:
+        for params in cfg.get("usajobs_searches", []):
             query = {**params, "DatePosted": days, "ResultsPerPage": 25, "Fields": "min"}
             try:
                 resp = requests.get(USAJOBS_BASE, headers=headers, params=query, timeout=15)
