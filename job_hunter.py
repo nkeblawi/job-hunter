@@ -32,11 +32,15 @@ from bs4 import BeautifulSoup
 # CONFIG  — points at the existing job-hunter config so orgs stay in one place
 # ══════════════════════════════════════════════════════════════════════════════
 
-_HERE = Path(__file__).parent
-CONFIG_PATH = _HERE / "config.yaml"
-KEYS_PATH = _HERE / "keys.yaml"
-SEEN_LOG = _HERE / "seen_jobs.json"
-MAX_ITERS = 60  # safety cap on agent loop iterations
+proj_path = Path(__file__).parent
+CONFIG_PATH = proj_path / "config.yaml"
+KEYS_PATH = proj_path / "keys.yaml"
+SEEN_LOG = proj_path / "seen_jobs.json"
+
+# Defaults — overridden by agent: block in config.yaml
+MAX_ITERS = 60
+MAX_TOKENS = 8192
+TOKEN_WARN = 0.90
 
 
 def load_config() -> dict:
@@ -607,6 +611,11 @@ def run_agent(cfg: dict, target_n: int, seen: dict, run_date: str, dry_run: bool
     profile = prompts.get("candidate_profile", "")
     scoring = prompts.get("score_system", "")
 
+    agent_cfg = cfg.get("agent", {})
+    max_tokens = int(agent_cfg.get("max_tokens", MAX_TOKENS))
+    max_iters = int(agent_cfg.get("max_iterations", MAX_ITERS))
+    token_warn = float(agent_cfg.get("token_warn_threshold", TOKEN_WARN))
+
     system_prompt = f"""You are an autonomous job hunting agent. Your mission: find {target_n} HIGH-priority \
 job listings for the candidate below, then send a report.
 
@@ -647,10 +656,10 @@ Be decisive. Never ask for confirmation. Search → score → report."""
     report_sent = False
     final_jobs = []
 
-    for iteration in range(MAX_ITERS):
+    for iteration in range(max_iters):
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4096,
+            max_tokens=max_tokens,
             system=system_prompt,
             tools=TOOLS,
             messages=messages,
@@ -659,17 +668,41 @@ Be decisive. Never ask for confirmation. Search → score → report."""
         # Log any text blocks the agent emits (its reasoning)
         for block in response.content:
             if block.type == "text" and block.text.strip():
-                # Indent and truncate for readability
                 preview = block.text.strip()[:300].replace("\n", "\n  ")
                 print(f"\n  💭 {preview}{'…' if len(block.text) > 300 else ''}")
 
         messages.append({"role": "assistant", "content": response.content})
 
+        # ── Token budget check ────────────────────────────────────────────────
+        # If we hit the limit OR burned ≥ 90% of our budget, inject an urgent
+        # message so Claude calls send_report on the very next turn.
+        token_pct = response.usage.output_tokens / max_tokens
+        near_limit = token_pct >= token_warn
+        hit_limit = response.stop_reason == "max_tokens"
+
+        if hit_limit or near_limit:
+            reason = "hit" if hit_limit else f"at {token_pct:.0%} of"
+            print(f"\n  ⚠️  Token budget {reason} limit — forcing send_report now.")
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "URGENT: You have used nearly all available output tokens. "
+                        "Stop all searching immediately. "
+                        "Call send_report RIGHT NOW with every HIGH-priority listing "
+                        "you have found so far, ranked by fit_score descending. "
+                        "Do not fetch any more orgs. Do not write any analysis. "
+                        "Your only next action must be a send_report tool call."
+                    ),
+                }
+            )
+            # Don't break — let the loop continue so Claude can call send_report
+
         if response.stop_reason == "end_turn":
             print("\n✅ Agent finished (end_turn).")
             break
 
-        if response.stop_reason != "tool_use":
+        if response.stop_reason not in ("tool_use", "max_tokens"):
             print(f"\n⚠️  Unexpected stop_reason: {response.stop_reason}")
             break
 
@@ -747,7 +780,7 @@ Be decisive. Never ask for confirmation. Search → score → report."""
             break
 
     else:
-        print(f"\n⚠️  Safety limit reached ({MAX_ITERS} iterations).")
+        print(f"\n⚠️  Safety limit reached ({max_iters} iterations).")
 
     return final_jobs, report_sent
 
