@@ -42,6 +42,11 @@ MAX_ITERS = 60
 MAX_TOKENS = 8192
 TOKEN_WARN = 0.90
 
+# Model tiers — Sonnet for reasoning/judgment, Haiku for cheap mechanical work.
+# Overridable via the agent: block in config.yaml.
+REASONING_MODEL = "claude-sonnet-4-6"   # orchestration + fit-scoring judgment
+EXTRACTION_MODEL = "claude-haiku-4-5"   # parsing scraped HTML into listings
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
@@ -226,8 +231,56 @@ def tool_fetch_greenhouse(
         return {"error": str(e), "org": org_name}
 
 
-def tool_fetch_html(org_name: str, urls: list[str], seen: dict) -> dict:
-    """Fetch and parse HTML careers pages, returning raw text for Claude to analyze."""
+def _parse_json_array(text: str) -> list:
+    """Best-effort parse of a JSON array from an LLM reply (strips fences/preamble)."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    start, end = text.find("["), text.rfind("]")
+    if start != -1 and end > start:
+        text = text[start : end + 1]
+    parsed = json.loads(text)
+    return parsed if isinstance(parsed, list) else []
+
+
+def extract_html_listings(
+    client, model: str, system_prompt: str, raw_text: str, org_name: str
+) -> list[dict]:
+    """Cheap tier: use Haiku to turn scraped page text into structured listings.
+
+    This is deliberately the *mechanical* half of the work (parse text → JSON).
+    Fit scoring stays on the reasoning model so judgment is uniform across sources.
+    """
+    resp = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Careers page text for {org_name}:\n\n{raw_text}\n\n"
+                    "Extract the job listings as a JSON array."
+                ),
+            }
+        ],
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    return _parse_json_array(text)
+
+
+def tool_fetch_html(
+    org_name: str,
+    urls: list[str],
+    seen: dict,
+    client=None,
+    extract_model: str = "",
+    extract_prompt: str = "",
+) -> dict:
+    """Fetch HTML careers pages. If a cheap extraction model is configured, Haiku
+    parses the page into structured listings; otherwise raw text is returned for
+    the reasoning model to parse itself (back-compat / fallback)."""
     JOB_SIGNALS = [
         "apply",
         "job",
@@ -276,6 +329,41 @@ def tool_fetch_html(org_name: str, urls: list[str], seen: dict) -> dict:
             "raw_text": None,
         }
 
+    # ── Cheap tier: let Haiku extract structured listings from the raw text ──────
+    if client and extract_model and extract_prompt:
+        try:
+            raw_listings = extract_html_listings(
+                client, extract_model, extract_prompt, combined_text[:10000], org_name
+            )
+            listings = []
+            for job in raw_listings[:40]:  # bound output to keep scoring load sane
+                title = (job.get("title") or "").strip()
+                if not title:
+                    continue
+                listings.append(
+                    {
+                        "org": org_name,
+                        "title": title,
+                        "location": (job.get("location") or "Unknown").strip(),
+                        "salary": (job.get("salary") or "").strip() or "Not listed",
+                        "posted": (job.get("posted") or "").strip() or "unknown",
+                        "url": (job.get("url") or "").strip() or (urls[0] if urls else ""),
+                        "source": "html",
+                        "already_seen": seen_key({"org": org_name, "title": title})
+                        in seen,
+                    }
+                )
+            return {
+                "org": org_name,
+                "listings": listings,
+                "extracted_by": extract_model,
+                "after_filters": len(listings),
+                "new": sum(1 for l in listings if not l["already_seen"]),
+            }
+        except Exception as e:
+            print(f"     ⚠️  Haiku extraction failed ({e}) — falling back to raw text.")
+
+    # ── Fallback / back-compat: hand raw text to the reasoning model to parse ────
     # Mark any titles in the text that are already seen (best-effort hint)
     seen_hint = [k.split("|")[1] for k in seen if k.startswith(org_name.lower())]
     return {
@@ -342,7 +430,7 @@ def tool_fetch_usajobs(keyword: str, cfg: dict, seen: dict, days: int = 3) -> di
 
 
 def tool_send_report(
-    jobs: list[dict], summary: str, cfg: dict, run_date: str, dry_run: bool
+    jobs: list[dict], cfg: dict, run_date: str, dry_run: bool
 ) -> dict:
     """Build an HTML report and email it (or print it in dry-run mode)."""
     rows = ""
@@ -419,10 +507,6 @@ def tool_send_report(
       <div style="background:white;border-radius:8px;padding:24px;
                   box-shadow:0 1px 3px rgba(0,0,0,.1)">
         <h2 style="color:#2c3e50;margin-top:0">🤖 Agentic Job Hunt — {run_date}</h2>
-        <p style="color:#555;font-style:italic;margin-bottom:16px;padding:10px 14px;
-                  background:#f0f4ff;border-left:4px solid #4a6fa5;border-radius:4px">
-          Agent summary: {summary}
-        </p>
         <p style="color:#666;margin-bottom:20px">
           Filters: remote/hybrid Loudoun Co. VA · $120K+ · no on-call · no sales/marketing
         </p>
@@ -493,9 +577,13 @@ TOOLS = [
     {
         "name": "fetch_html_jobs",
         "description": (
-            "Fetch HTML careers pages for an org and return raw page text. "
-            "You must extract and score the job listings yourself from the raw_text field. "
-            "already_seen_titles lists titles previously emailed — skip those when extracting."
+            "Fetch an org's HTML careers pages. Normally returns structured job "
+            "listings already extracted from the page (title, location, salary, "
+            "posted, url) in a 'listings' array — score these yourself, exactly like "
+            "Greenhouse results. Listings with already_seen=true were previously "
+            "emailed; skip them. FALLBACK: if extraction fails the result instead "
+            "contains 'raw_text' (plus already_seen_titles) — in that case extract "
+            "the listings from the text yourself, skipping already-seen titles, then score."
         ),
         "input_schema": {
             "type": "object",
@@ -589,12 +677,8 @@ TOOLS = [
                         ],
                     },
                 },
-                "summary": {
-                    "type": "string",
-                    "description": "2-3 sentence summary of search strategy, orgs checked, and what you found",
-                },
             },
-            "required": ["jobs", "summary"],
+            "required": ["jobs"],
         },
     },
 ]
@@ -615,6 +699,9 @@ def run_agent(cfg: dict, target_n: int, seen: dict, run_date: str, dry_run: bool
     max_tokens = int(agent_cfg.get("max_tokens", MAX_TOKENS))
     max_iters = int(agent_cfg.get("max_iterations", MAX_ITERS))
     token_warn = float(agent_cfg.get("token_warn_threshold", TOKEN_WARN))
+    reasoning_model = agent_cfg.get("reasoning_model", REASONING_MODEL)
+    extraction_model = agent_cfg.get("extraction_model", EXTRACTION_MODEL)
+    html_extract_prompt = prompts.get("html_extract_only_system", "")
 
     system_prompt = f"""You are an autonomous job hunting agent. Your mission: find {target_n} HIGH-priority \
 job listings for the candidate below, then send a report.
@@ -630,7 +717,9 @@ HOW TO WORK:
 2. Choose an efficient search order — start with Greenhouse orgs (structured data, fast), \
 then HTML orgs, then USAJobs keywords.
 3. For each Greenhouse or USAJobs result: score every listing you receive directly.
-4. For each HTML result: extract listings from raw_text, then score them.
+4. For each HTML result: you will normally receive already-extracted structured \
+listings — score them just like Greenhouse results. (Only if a result returns raw_text \
+instead must you extract the listings from the text yourself before scoring.)
 5. Skip any listing where already_seen=true or title appears in already_seen_titles.
 6. Track your HIGH-priority count. Once you hit {target_n} fresh HIGH results, \
 call send_report immediately — don't keep searching.
@@ -651,14 +740,17 @@ Be decisive. Never ask for confirmation. Search → score → report."""
         }
     ]
 
-    print(f"\n🤖 Agent starting — target: {target_n} HIGH-priority results\n{'─'*50}")
+    print(f"\n🤖 Agent starting — target: {target_n} HIGH-priority results")
+    print(
+        f"   Models: reasoning={reasoning_model} · extraction={extraction_model}\n{'─'*50}"
+    )
 
     report_sent = False
     final_jobs = []
 
     for iteration in range(max_iters):
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=reasoning_model,
             max_tokens=max_tokens,
             system=system_prompt,
             tools=TOOLS,
@@ -736,9 +828,21 @@ Be decisive. Never ask for confirmation. Search → score → report."""
                 )
 
             elif name == "fetch_html_jobs":
-                result = tool_fetch_html(inp["org_name"], inp["urls"], seen)
-                if result.get("raw_text"):
-                    print(f"     → {len(result['raw_text'])} chars fetched")
+                result = tool_fetch_html(
+                    inp["org_name"],
+                    inp["urls"],
+                    seen,
+                    client=client,
+                    extract_model=extraction_model,
+                    extract_prompt=html_extract_prompt,
+                )
+                if result.get("listings") is not None:
+                    print(
+                        f"     → {len(result['listings'])} listing(s) "
+                        f"({result.get('new', 0)} new) via {result.get('extracted_by', '?')}"
+                    )
+                elif result.get("raw_text"):
+                    print(f"     → {len(result['raw_text'])} chars fetched (raw)")
                 else:
                     print(
                         f"     → {result.get('note', result.get('error', 'no content'))}"
@@ -754,9 +858,7 @@ Be decisive. Never ask for confirmation. Search → score → report."""
                 )
 
             elif name == "send_report":
-                result = tool_send_report(
-                    inp["jobs"], inp["summary"], cfg, run_date, dry_run
-                )
+                result = tool_send_report(inp["jobs"], cfg, run_date, dry_run)
                 final_jobs = inp["jobs"]
                 status = result.get("status")
                 print(f"     → {result['job_count']} job(s) — status: {status}")

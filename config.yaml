@@ -30,12 +30,25 @@ agent:
   # 0.90 = warn at 90% consumed. Lower to 0.80 if you still see truncation.
   token_warn_threshold: 0.90
 
+  # ── Model routing (tiered for cost efficiency) ──────────────────────────────
+  # The agent runs on two model tiers:
+  #   reasoning_model  → search orchestration, planning, and fit-scoring judgment
+  #   extraction_model → cheap, high-volume parsing of scraped HTML careers pages
+  #                      into structured listings (mechanical, low-judgment work)
+  # Routing the messy HTML extraction to Haiku keeps the large raw page text out
+  # of the reasoning model's context — cutting cost while keeping scoring quality
+  # uniform (every listing, from every source, is still scored by reasoning_model).
+  # Confirm the exact model IDs match what your Anthropic account has access to.
+  reasoning_model: claude-sonnet-4-6
+  extraction_model: claude-haiku-4-5
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROMPTS — Edit freely. These are sent directly to Claude.
-# candidate_profile  →  used by all sources
-# score_system       →  used when scoring pre-fetched listings (Greenhouse, USAJobs)
-# html_extract_system → used for HTML pages (extract + score in one Claude call)
+# candidate_profile       →  used by all sources
+# score_system            →  scoring pre-fetched listings (Greenhouse, USAJobs, HTML)
+# html_extract_only_system → Haiku tier: extract HTML listings (no scoring)
+# html_extract_system      → legacy combined extract+score prompt (unused; kept for ref)
 # ══════════════════════════════════════════════════════════════════════════════
 
 prompts:
@@ -169,6 +182,30 @@ prompts:
         "skills_gap": "",
         "flags": ""
       }
+    ]
+
+  # Used by the Haiku extraction tier. Mechanical parsing ONLY — no scoring,
+  # ranking, or judgment (the reasoning model scores every listing afterward).
+  html_extract_only_system: |
+    You are a precise web-scraping extraction tool. You receive raw text scraped
+    from a company's careers page. Extract every visible individual job listing.
+
+    For each listing, identify:
+      - title    : the job title (required — skip entries without one)
+      - location : office/remote location, or "Unknown"
+      - salary   : pay range if shown, else ""
+      - posted   : posting date if shown (ISO format preferred), else "unknown"
+      - url      : the direct apply/listing URL if visible, else ""
+
+    Ignore navigation links, category headers, department names, cookie/legal
+    boilerplate, and anything that is not a real individual job opening.
+    Do NOT score, rank, filter by fit, or editorialize — extraction only.
+
+    Return ONLY a valid JSON array — no markdown, no preamble. Return [] if the
+    page has no real listings (e.g. it is empty or JS-rendered).
+
+    [
+      {"title": "", "location": "", "salary": "", "posted": "", "url": ""}
     ]
 
 

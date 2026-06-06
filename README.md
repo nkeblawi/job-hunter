@@ -2,7 +2,11 @@
 
 An agentic job search tool powered by Claude. The agent autonomously decides which employers
 to check, in what order, and stops the moment it finds your target number of HIGH-priority
-listings — then emails you the results.
+listings — then emails you the results. You will get an email within 2 to 5 minutes of running
+the job_hunter command, which kicks off the agentic workflow.
+
+**DISCLAIMER: This is NOT an auto-apply tool! You can manually apply to the roles listed by this tool.
+But if you are looking for something that automatically applies to roles, you're in the wrong place.**
 
 ![Sample Email Result](images/email_example.jpg)
 
@@ -71,6 +75,26 @@ scores, and reports.
 
 ---
 
+## Model Routing (Haiku + Sonnet)
+
+The agent runs on two model tiers, each matched to the kind of work it does:
+
+| Tier | Model | Handles |
+|---|---|---|
+| **Reasoning** | `claude-sonnet-4-6` | Search orchestration, deciding which orgs to check and when to stop, and **fit-scoring every listing** from all sources |
+| **Extraction** | `claude-haiku-4-5` | The mechanical work: parsing raw scraped HTML careers pages into structured listings (title, location, salary, date, URL) |
+
+**Why split it this way?** Greenhouse and USAJobs already return clean structured data, but HTML
+pages come back as large blobs of raw page text. Routing that messy extraction to Haiku keeps the
+bulky raw text out of the Sonnet context — cutting cost — while **all scoring judgment stays on
+Sonnet**, so fit quality is uniform no matter which source a listing came from. If a Haiku
+extraction fails, the pipeline falls back to handing the raw text to Sonnet, so a run never breaks.
+
+Both model IDs are configurable under `agent:` in `config.yaml` (`reasoning_model`,
+`extraction_model`).
+
+---
+
 ## Sources
 
 | Source | Method | Notes |
@@ -118,8 +142,10 @@ html_orgs:
 ## Cost
 
 ~$0.15–0.40 per run depending on how many orgs are checked and listings scored.
-Uses `claude-sonnet-4-6`. Runs stop early once the HIGH-priority target is hit,
-which limits cost on days with many matching listings.
+Uses tiered model routing — `claude-sonnet-4-6` for reasoning and scoring,
+`claude-haiku-4-5` for HTML extraction (see [Model Routing](#model-routing-haiku--sonnet)).
+Runs also stop early once the HIGH-priority target is hit, which limits cost on
+days with many matching listings.
 
 ---
 
